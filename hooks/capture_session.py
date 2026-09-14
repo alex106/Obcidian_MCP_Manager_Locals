@@ -9,7 +9,13 @@ thinking. That keeps the "no API key, agent does the work" rule intact even
 for automatic capture.
 
 Input: hook JSON on stdin (session_id, transcript_path, cwd, hook_event_name).
-Config: OBSIDIAN_VAULT env var.
+Vault: --vault PATH, else $OBSIDIAN_VAULT, else a vault next to the project.
+
+--vault is how `install` wires this, and it is the only reliable channel: the
+`env` block of an MCP server config applies to the MCP server subprocess only,
+so a hook never inherits OBSIDIAN_VAULT from there. Relying on the env var
+alone makes the hook a silent no-op in a real session.
+
 Exit: always 0 -- a failed capture must never block the session.
 """
 
@@ -70,17 +76,47 @@ def read_transcript(path: str) -> list[tuple[str, str]]:
     return turns
 
 
+def looks_like_vault(p: Path) -> bool:
+    return p.is_dir() and (
+        (p / ".obsidian").is_dir() or (p / ".secondbrain" / "config.json").exists()
+    )
+
+
+def resolve_vault(payload: dict) -> Path | None:
+    """--vault, then $OBSIDIAN_VAULT, then a vault beside the project."""
+    argv = sys.argv[1:]
+    for i, a in enumerate(argv):
+        if a == "--vault" and i + 1 < len(argv):
+            candidate = argv[i + 1]
+            break
+        if a.startswith("--vault="):
+            candidate = a.split("=", 1)[1]
+            break
+    else:
+        candidate = os.environ.get("OBSIDIAN_VAULT")
+
+    if candidate:
+        p = Path(os.path.expandvars(os.path.expanduser(candidate)))
+        return p if p.is_dir() else None
+
+    # Last resort: a vault sitting in the project directory.
+    base = payload.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR")
+    if base:
+        for name in ("SecondBrain", "secondbrain"):
+            p = Path(base) / name
+            if looks_like_vault(p):
+                return p
+    return None
+
+
 def main() -> int:
     try:
         payload = json.loads(sys.stdin.read() or "{}")
     except json.JSONDecodeError:
         payload = {}
 
-    vault = os.environ.get("OBSIDIAN_VAULT")
-    if not vault:
-        return 0
-    root = Path(os.path.expandvars(os.path.expanduser(vault)))
-    if not root.is_dir():
+    root = resolve_vault(payload)
+    if root is None:
         return 0
 
     cfg = {}

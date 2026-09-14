@@ -143,7 +143,10 @@ def cmd_install(args) -> int:
 
     server = {"command": py, "args": ["-m", "obsidian_secondbrain"],
               "env": {"OBSIDIAN_VAULT": vault_s}}
-    hook_cmd = f'"{py}" "{HOOK_SCRIPT}"'
+    # The vault must be passed on the command line: a hook does NOT inherit the
+    # MCP server's `env` block, so relying on OBSIDIAN_VAULT here would make the
+    # hook a silent no-op.
+    hook_cmd = f'"{py}" "{HOOK_SCRIPT}" --vault "{vault_s}"'
     hook_entry = [{"hooks": [{"type": "command", "command": hook_cmd, "timeout": 15}]}]
 
     if args.scope == "project":
@@ -197,6 +200,20 @@ SYNTH_TRANSCRIPT = [
 ]
 
 
+def registered_hook_command(project: Path) -> str | None:
+    """The capture hook command as actually registered, project scope first."""
+    for path in (project / ".claude" / "settings.local.json",
+                 project / ".claude" / "settings.json",
+                 Path.home() / ".claude" / "settings.json"):
+        settings = read_json(path)
+        for event in HOOK_EVENTS:
+            for entry in settings.get("hooks", {}).get(event, []):
+                for h in entry.get("hooks", []):
+                    if "capture_session.py" in h.get("command", ""):
+                        return h["command"]
+    return None
+
+
 def cmd_test_hook(args) -> int:
     """Actually fire the hook and verify it wrote a note, then clean up."""
     project = project_dir(args.project)
@@ -238,11 +255,22 @@ def cmd_test_hook(args) -> int:
     def record(name, ok, detail=""):
         checks.append({"check": name, "ok": bool(ok), "detail": detail})
 
+    # Run the command exactly as it is REGISTERED, in an environment with
+    # OBSIDIAN_VAULT stripped -- which is what a real Claude Code session gives
+    # a hook. Synthesising a command here, or injecting the env var, would let a
+    # hook that is a no-op in practice pass this test.
+    registered = registered_hook_command(project)
+    record("hook is registered in settings", registered is not None,
+           "no capture_session.py hook found in project or user settings")
+    env = {k: v for k, v in os.environ.items() if k != "OBSIDIAN_VAULT"}
+    env["CLAUDE_PROJECT_DIR"] = str(project)
+
     try:
+        cmd = registered or f'"{python_exe()}" "{HOOK_SCRIPT}" --vault "{vault}"'
         proc = subprocess.run(
-            [python_exe(), str(HOOK_SCRIPT)],
+            cmd, shell=True,
             input=json.dumps(payload), text=True, capture_output=True, timeout=30,
-            env={**os.environ, "OBSIDIAN_VAULT": str(vault)},
+            env=env,
         )
         record("hook exits 0", proc.returncode == 0,
                f"rc={proc.returncode} stderr={proc.stderr.strip()[:300]}")

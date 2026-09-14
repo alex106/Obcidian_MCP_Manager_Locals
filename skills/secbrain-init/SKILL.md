@@ -99,19 +99,28 @@ This is the part that matters. Never report success without it.
 "$PY" -m obsidian_secondbrain.cli test-hook --project "<root>"
 ```
 
-It writes a synthetic transcript, fires the real hook as a subprocess against
-the real vault, and asserts six things: the hook exits 0, it wrote exactly one
-inbox note, the note carries the transcript text, it is marked
+It writes a synthetic transcript, then runs **the command exactly as it is
+registered in settings**, in an environment with `OBSIDIAN_VAULT` deliberately
+stripped — which is what a real Claude Code session gives a hook. It asserts
+seven things: a capture hook is registered at all, it exits 0, it wrote exactly
+one inbox note, the note carries the transcript text, it is marked
 `distilled: false`, tool-call noise was excluded, and the daily log got a
 pointer. It then restores the vault byte-for-byte — the inbox note is deleted
-and the daily log is rolled back — so running it repeatedly leaves no residue.
+and the daily log rolled back — so repeated runs leave no residue.
+
+Running the registered command under a stripped environment is the whole point.
+A hook does **not** inherit the `env` block of an MCP server config, so a hook
+registered without `--vault` finds no vault, exits 0 and silently writes
+nothing. A test that synthesises its own command, or injects `OBSIDIAN_VAULT`,
+will happily pass a hook that does nothing in practice.
 
 If any check fails, report which one and its `detail`. Common causes:
 
 | Failing check | Likely cause |
 |---|---|
+| hook is registered in settings | `install` never ran, or wrote to a different scope |
 | hook exits 0 | wrong interpreter path, or the package is not installed in that venv |
-| wrote exactly one inbox note | `OBSIDIAN_VAULT` not reaching the hook, or vault path wrong |
+| wrote exactly one inbox note | the registered command is missing `--vault` (an old install) — re-run `install` |
 | note carries transcript text | transcript format changed — check `read_transcript` |
 | daily log got a pointer | log folder renamed in `config.json` |
 

@@ -54,9 +54,16 @@ replaces this hook rather than stacking duplicates.
 `.claude/settings.local.json` — hooks go in the local file because they embed
 absolute machine paths. `--scope user` registers one vault globally instead.
 
-`test-hook` is the one that matters: it writes a synthetic transcript, runs the
-real hook against the real vault, asserts six properties of the note it
-produced, then restores the vault byte-for-byte.
+`test-hook` is the one that matters: it writes a synthetic transcript, runs
+**the command exactly as registered** with `OBSIDIAN_VAULT` stripped from the
+environment — what a real session gives a hook — asserts seven properties of
+the note it produced, then restores the vault byte-for-byte.
+
+That last detail is not pedantry. A hook does not inherit the `env` block of an
+MCP server config, so a hook registered without `--vault` finds no vault, exits
+0 and silently writes nothing. `install` therefore passes the vault on the
+command line, and `test-hook` runs the registered command under a stripped
+environment so a no-op hook cannot pass.
 
 ## Configuration
 
@@ -152,4 +159,5 @@ hooks/capture_session.py    PreCompact / SessionEnd raw capture
 scripts/install.py          settings.json registration (user scope)
 skills/secbrain-init/       Claude Code skill: /secbrain-init
 tests/test_lifecycle.py     34 assertions over a real stdio MCP client
+tests/test_hook_wiring.py   proves test-hook rejects an env-only hook
 ```

@@ -44,7 +44,9 @@ def build(vault: str, hooks: bool) -> tuple[dict, dict]:
     }
     if not hooks:
         return server, {}
-    hook_cmd = f'"{py}" "{PROJECT / "hooks" / "capture_session.py"}"'
+    # --vault, not the env var: a hook does not inherit the MCP server's `env`,
+    # so an env-only hook silently does nothing in a real session.
+    hook_cmd = f'"{py}" "{PROJECT / "hooks" / "capture_session.py"}" --vault "{vault}"'
     entry = [{"hooks": [{"type": "command", "command": hook_cmd, "timeout": 15}]}]
     return server, {"PreCompact": entry, "SessionEnd": entry}
 
