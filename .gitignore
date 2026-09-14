@@ -1,0 +1,25 @@
+# virtualenvs
+.venv/
+venv/
+env/
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# never commit a vault or local settings
+*.vault/
+.secondbrain/
+settings.json.bak-*
