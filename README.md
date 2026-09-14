@@ -39,6 +39,7 @@ tested code and behaves the same every time.
 ```bash
 PY=.venv/Scripts/python.exe    # or .venv/bin/python
 
+$PY -m obsidian_secondbrain.cli detect    --project .   # OS, runtime, which client
 $PY -m obsidian_secondbrain.cli doctor    --project .   # what is / isn't set up
 $PY -m obsidian_secondbrain.cli init      --project .   # create or reuse the vault
 $PY -m obsidian_secondbrain.cli install   --project .   # register server + hooks
@@ -49,6 +50,44 @@ Each prints one JSON object and exits non-zero on failure. `init` and
 `install` are idempotent: existing notes are never touched, config files are
 backed up before rewriting, unrelated entries are preserved, and re-running
 replaces this hook rather than stacking duplicates.
+
+## Which clients work
+
+The server is plain stdio MCP, so **any** MCP client can use all 27 tools; the
+vault is plain markdown that Obsidian itself reads. What differs is the
+automation around it.
+
+| | Claude Code | Codex | Copilot / VS Code | Cursor |
+|---|---|---|---|---|
+| 27 MCP tools | yes | yes | yes | yes |
+| `capture_session` (manual compact) | yes | yes | yes | yes |
+| MCP prompts | yes | varies | yes | yes |
+| **Automatic capture hooks** | **yes** | no | no | no |
+| `/secbrain-init` skill | yes | no | no | no |
+
+Only *automatic* capture is Claude Code-specific: `PreCompact`/`SessionEnd`
+have no equivalent elsewhere, and the hook parses Claude Code's transcript
+format. Everything else is portable — `capture_session` is an ordinary tool, so
+an agent writing its own summary and filing it works anywhere. `install
+--with-instructions` writes `AGENTS.md` / `.github/copilot-instructions.md` /
+`.cursor/rules/secbrain.md` so those agents know to call it.
+
+`detect` identifies the client from evidence and distinguishes an `agent`
+signal (we are running as it) from a `host` signal (it is merely the editor
+hosting the terminal) — Claude Code inside a VS Code terminal makes both look
+active.
+
+```bash
+$PY -m obsidian_secondbrain.cli install --project . --client codex  --scope user --with-instructions
+$PY -m obsidian_secondbrain.cli install --project . --client vscode --with-instructions
+$PY -m obsidian_secondbrain.cli install --project . --client all
+```
+
+Config shapes are not interchangeable, and a wrong shape is silently ignored
+with no error: VS Code uses root key `servers` and requires `"type": "stdio"`;
+Claude Code, Copilot and Cursor use `mcpServers`; Codex uses TOML
+`[mcp_servers.NAME]`. The Codex writer patches only its own table so comments
+and other servers survive.
 
 `install --scope project` (default) writes `.mcp.json` plus
 `.claude/settings.local.json` — hooks go in the local file because they embed
@@ -154,10 +193,13 @@ src/obsidian_secondbrain/
   capture.py   daily log, session notes
   distill.py   distill queue, concept notes, health, maps
   server.py    MCP tool + prompt surface
-  cli.py       doctor / init / install / test-hook bootstrap
+  cli.py       detect / doctor / init / install / test-hook bootstrap
+  environment.py  evidence-based OS + client detection
+  clients.py      per-client config writers (json / toml shapes)
 hooks/capture_session.py    PreCompact / SessionEnd raw capture
 scripts/install.py          settings.json registration (user scope)
 skills/secbrain-init/       Claude Code skill: /secbrain-init
 tests/test_lifecycle.py     34 assertions over a real stdio MCP client
 tests/test_hook_wiring.py   proves test-hook rejects an env-only hook
+tests/test_clients.py       pins each client's config shape
 ```

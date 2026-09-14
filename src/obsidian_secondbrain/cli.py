@@ -24,7 +24,9 @@ import sys
 import tempfile
 from pathlib import Path
 
+from . import clients as _clients
 from .config import DEFAULT_CONFIG, load_config
+from .environment import detect_all
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
 PROJECT_ROOT = PACKAGE_ROOT.parent.parent          # the obsidian-mcp checkout
@@ -127,7 +129,63 @@ def cmd_init(args) -> int:
     })
 
 
+# ----------------------------------------------------------------- detect --
+
+def cmd_detect(args) -> int:
+    """Identify the environment and say what to do about it."""
+    project = project_dir(args.project)
+    report = detect_all(project, PROJECT_ROOT)
+
+    steps: list[str] = []
+    rt = report["runtime"]
+    if not rt["venv_present"]:
+        steps.append(f"create the venv: python -m venv {PROJECT_ROOT / '.venv'}")
+    elif rt["package_installed_in_venv"] is False:
+        steps.append(f"install the package: \"{python_exe()}\" -m pip install -e {PROJECT_ROOT}")
+
+    primary = report["primary"]
+    if primary is None:
+        steps.append("no client identified -- pass --client explicitly "
+                     f"(one of: {', '.join(_clients.WRITERS)})")
+    else:
+        found = next(c for c in report["clients"] if c["key"] == primary)
+        if not found["configured"]:
+            steps.append(f"register the server: install --client {primary}")
+        if not found["capabilities"]["session_hooks"]:
+            steps.append("this client has no session hooks -- automatic capture is "
+                         "unavailable; use --with-instructions so the agent knows "
+                         "to call capture_session itself")
+
+    others = [c for c in report["clients"]
+              if c["key"] != primary and (c["installed"] or c["configured"])]
+    if others:
+        steps.append("other clients are present too: "
+                     + ", ".join(f"{c['name']} ({c['status']})" for c in others)
+                     + " -- install --client all covers them")
+
+    report["recommended_steps"] = steps
+    report["ok"] = True
+    return out(report)
+
+
 # ---------------------------------------------------------------- install --
+
+def resolve_clients(args, project: Path) -> tuple[list[str], str]:
+    """Which clients to configure, and why."""
+    if args.client == "all":
+        report = detect_all(project, PROJECT_ROOT)
+        present = report["present"]
+        return (present or ["claude"],
+                "all clients found on this machine" if present
+                else "no client detected; defaulted to Claude Code")
+    if args.client != "auto":
+        return [args.client], "named explicitly with --client"
+
+    report = detect_all(project, PROJECT_ROOT)
+    if report["primary"]:
+        return [report["primary"]], report["primary_reason"]
+    return ["claude"], "no client detected; defaulted to Claude Code"
+
 
 def cmd_install(args) -> int:
     project = project_dir(args.project)
@@ -139,6 +197,43 @@ def cmd_install(args) -> int:
 
     py = python_exe()
     vault_s = str(vault).replace("\\", "/")
+    targets, why = resolve_clients(args, project)
+
+    results: dict[str, dict] = {}
+    notes: list[str] = []
+
+    for key in targets:
+        if key == "claude":
+            continue  # handled below, it is the only one with hooks
+        if key == "codex":
+            path = (project / ".codex" / "config.toml" if args.scope == "project"
+                    else Path.home() / ".codex" / "config.toml")
+            results[key] = _clients.write_codex(path, py, vault_s)
+        else:
+            writer = _clients.WRITERS.get(key)
+            if writer is None:
+                results[key] = {"error": f"no writer for client {key!r}"}
+                continue
+            results[key] = writer(project, py, vault_s)
+
+        if args.with_instructions and key in _clients.INSTRUCTION_FILE:
+            target = _clients.INSTRUCTION_FILE[key](project)
+            results[key].setdefault("files", []).extend(
+                _clients.write_instructions(target)["files"])
+        notes.append(f"{key}: no session hooks -- capture must be called by the agent")
+
+    if "claude" not in targets:
+        return out({
+            "ok": True,
+            "clients": targets,
+            "why": why,
+            "vault": str(vault),
+            "python": py,
+            "results": results,
+            "caveats": notes,
+            "next_step": "Restart the client, then confirm the server is connected.",
+        })
+
     changed = []
 
     server = {"command": py, "args": ["-m", "obsidian_secondbrain"],
@@ -179,12 +274,16 @@ def cmd_install(args) -> int:
 
     return out({
         "ok": True,
+        "clients": targets,
+        "why": why,
         "scope": args.scope,
         "vault": str(vault),
         "python": py,
         "files_written": changed,
+        "results": results,
         "mcp_server": SERVER_KEY,
         "hooks": [] if args.no_hooks else list(HOOK_EVENTS),
+        "caveats": notes,
         "next_step": "Restart Claude Code, then /mcp to confirm the server connects.",
     })
 
@@ -382,16 +481,23 @@ def main(argv: list[str] | None = None) -> int:
                             f"path (default: {DEFAULT_VAULT_DIRNAME})")
 
     common(sub.add_parser("init", help="create or reuse the project vault"))
+    common(sub.add_parser("detect", help="identify OS, runtime and agent client"))
     p = sub.add_parser("install", help="register the MCP server and capture hooks")
     common(p)
     p.add_argument("--scope", choices=["project", "user"], default="project")
     p.add_argument("--no-hooks", action="store_true")
+    p.add_argument("--client", default="auto",
+                   choices=["auto", "all", *sorted(_clients.WRITERS)],
+                   help="which agent client to configure (default: auto-detect)")
+    p.add_argument("--with-instructions", action="store_true",
+                   help="also write AGENTS.md / copilot-instructions.md for "
+                        "clients that have no session hooks")
     common(sub.add_parser("test-hook", help="fire the capture hook and verify it"))
     common(sub.add_parser("doctor", help="report setup status"))
 
     args = ap.parse_args(argv)
     return {
-        "init": cmd_init, "install": cmd_install,
+        "init": cmd_init, "install": cmd_install, "detect": cmd_detect,
         "test-hook": cmd_test_hook, "doctor": cmd_doctor,
     }[args.cmd](args)
 
