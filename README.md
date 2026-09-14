@@ -14,7 +14,8 @@ python -m venv .venv
 .venv/Scripts/python.exe -m pip install -e .          # Windows
 # .venv/bin/python -m pip install -e .                # macOS/Linux
 
-# register with Claude Code (backs up settings.json first)
+# register with Claude Code (server -> ~/.claude.json, hooks -> ~/.claude/settings.json;
+# both backed up first)
 .venv/Scripts/python.exe scripts/install.py --vault "C:/path/to/YourVault"
 ```
 
@@ -71,6 +72,19 @@ format. Everything else is portable — `capture_session` is an ordinary tool, s
 an agent writing its own summary and filing it works anywhere. `install
 --with-instructions` writes `AGENTS.md` / `.github/copilot-instructions.md` /
 `.cursor/rules/secbrain.md` so those agents know to call it.
+
+### The context-first rule
+
+`install` also writes a marked block into the project's rule file — `CLAUDE.md`
+for Claude Code, with no flag needed — whose first instruction is: **before
+acting on the first request of a session, search the vault**.
+
+Claude Code gets this even though it needs no manual capture, because the two
+solve opposite halves of the problem. A hook *writes* the vault when a session
+**ends**; nothing otherwise makes an agent *read* it when a session **begins**.
+Without the rule the vault only ever fills up, and every session starts by
+re-deriving what is already written down. `doctor` reports
+`project_rules.has_session_start_rule`, and `--no-instructions` opts out.
 
 `detect` identifies the client from evidence and distinguishes an `agent`
 signal (we are running as it) from a `host` signal (it is merely the editor
@@ -197,7 +211,7 @@ src/obsidian_secondbrain/
   environment.py  evidence-based OS + client detection
   clients.py      per-client config writers (json / toml shapes)
 hooks/capture_session.py    PreCompact / SessionEnd raw capture
-scripts/install.py          settings.json registration (user scope)
+scripts/install.py          user-scope registration (~/.claude.json + settings.json)
 skills/secbrain-init/       Claude Code skill: /secbrain-init
 tests/test_lifecycle.py     34 assertions over a real stdio MCP client
 tests/test_hook_wiring.py   proves test-hook rejects an env-only hook

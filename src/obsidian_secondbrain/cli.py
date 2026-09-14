@@ -33,6 +33,13 @@ PROJECT_ROOT = PACKAGE_ROOT.parent.parent          # the obsidian-mcp checkout
 HOOK_SCRIPT = PROJECT_ROOT / "hooks" / "capture_session.py"
 SERVER_KEY = "obsidian-secondbrain"
 HOOK_EVENTS = ("PreCompact", "SessionEnd")
+
+# Claude Code reads user-scoped MCP servers from ~/.claude.json, and hooks from
+# ~/.claude/settings.json. They are different files with different schemas:
+# `settings.json` has no `mcpServers` key, so a server written there is dropped
+# without an error anywhere -- the client simply starts with no such server.
+CLAUDE_USER_CONFIG = Path.home() / ".claude.json"
+CLAUDE_USER_SETTINGS = Path.home() / ".claude" / "settings.json"
 DEFAULT_VAULT_DIRNAME = "SecondBrain"
 
 
@@ -231,7 +238,7 @@ def cmd_install(args) -> int:
         if args.with_instructions and key in _clients.INSTRUCTION_FILE:
             target = _clients.INSTRUCTION_FILE[key](project)
             results[key].setdefault("files", []).extend(
-                _clients.write_instructions(target)["files"])
+                _clients.write_instructions(target, key)["files"])
         notes.append(f"{key}: no session hooks -- capture must be called by the agent")
 
     if "claude" not in targets:
@@ -259,21 +266,32 @@ def cmd_install(args) -> int:
     if args.scope == "project":
         # .mcp.json is the project-scoped MCP config Claude Code reads.
         mcp_path = project / ".mcp.json"
-        mcp = read_json(mcp_path)
-        before = json.dumps(mcp.get("mcpServers", {}).get(SERVER_KEY))
-        mcp.setdefault("mcpServers", {})[SERVER_KEY] = server
-        if before != json.dumps(server):
-            write_json(mcp_path, mcp)
-            changed.append(str(mcp_path))
         # Hooks carry absolute machine-specific paths, so they belong in the
         # personal, gitignored settings file rather than the shared one.
         settings_path = project / ".claude" / "settings.local.json"
     else:
-        settings_path = Path.home() / ".claude" / "settings.json"
+        # NOT settings.json -- see CLAUDE_USER_CONFIG above.
+        mcp_path = CLAUDE_USER_CONFIG
+        settings_path = CLAUDE_USER_SETTINGS
+
+    mcp = read_json(mcp_path)
+    # Claude Code writes `"mcpServers": []` into a fresh ~/.claude.json, so the
+    # existing value is not necessarily the mapping setdefault would assume.
+    if not isinstance(mcp.get("mcpServers"), dict):
+        mcp["mcpServers"] = {}
+    before = json.dumps(mcp["mcpServers"].get(SERVER_KEY))
+    mcp["mcpServers"][SERVER_KEY] = server
+    if before != json.dumps(server):
+        write_json(mcp_path, mcp)
+        changed.append(str(mcp_path))
 
     settings = read_json(settings_path)
-    if args.scope == "user":
-        settings.setdefault("mcpServers", {})[SERVER_KEY] = server
+    # Installs before this fix put the server in settings.json, where it was
+    # silently ignored. Leaving it there would keep doctor reporting a server
+    # that never connects.
+    if settings.pop("mcpServers", None) is not None:
+        notes.append(f"removed an ignored mcpServers block from {settings_path} "
+                     f"(the server belongs in {mcp_path})")
 
     if not args.no_hooks:
         for event in HOOK_EVENTS:
@@ -283,6 +301,14 @@ def cmd_install(args) -> int:
 
     write_json(settings_path, settings)
     changed.append(str(settings_path))
+
+    # Claude Code has hooks, but a hook only writes the vault at the end of a
+    # session. The context-first rule has to reach the model itself, and
+    # CLAUDE.md is the only channel that is read on every new session.
+    if not args.no_instructions:
+        rules = _clients.write_instructions(
+            _clients.INSTRUCTION_FILE["claude"](project), "claude")
+        changed.extend(rules["files"])
 
     return out({
         "ok": True,
@@ -295,6 +321,8 @@ def cmd_install(args) -> int:
         "results": results,
         "mcp_server": SERVER_KEY,
         "hooks": [] if args.no_hooks else list(HOOK_EVENTS),
+        "project_rules": None if args.no_instructions else str(
+            _clients.INSTRUCTION_FILE["claude"](project)),
         "caveats": notes,
         "next_step": "Restart Claude Code, then /mcp to confirm the server connects.",
     })
@@ -431,7 +459,7 @@ def cmd_doctor(args) -> int:
 
     mcp_path = project / ".mcp.json"
     proj_settings = project / ".claude" / "settings.local.json"
-    user_settings = Path.home() / ".claude" / "settings.json"
+    user_settings = CLAUDE_USER_SETTINGS
 
     def hooks_in(path: Path) -> list[str]:
         s = read_json(path)
@@ -439,9 +467,20 @@ def cmd_doctor(args) -> int:
                 if "capture_session.py" in json.dumps(s.get("hooks", {}).get(e, []))]
 
     def server_in(path: Path) -> dict | None:
-        return read_json(path).get("mcpServers", {}).get(SERVER_KEY)
+        servers = read_json(path).get("mcpServers")
+        return servers.get(SERVER_KEY) if isinstance(servers, dict) else None
 
-    registered = server_in(mcp_path) or server_in(user_settings)
+    # Only the two files Claude Code actually reads servers from count as
+    # registered. settings.json is checked separately, as a fault: a server
+    # there looks installed to a human reading the file, and is inert.
+    registered = server_in(mcp_path) or server_in(CLAUDE_USER_CONFIG)
+    stranded = server_in(user_settings)
+
+    rules_file = _clients.INSTRUCTION_FILE["claude"](project)
+    rules_text = (rules_file.read_text(encoding="utf-8", errors="replace")
+                  if rules_file.exists() else "")
+    has_rules = _clients.AGENTS_SECTION_START in rules_text
+
     report = {
         "project": str(project),
         "vault": {
@@ -453,13 +492,21 @@ def cmd_doctor(args) -> int:
         },
         "mcp_server": {
             "registered_project": bool(server_in(mcp_path)),
-            "registered_user": bool(server_in(user_settings)),
+            "registered_user": bool(server_in(CLAUDE_USER_CONFIG)),
+            "stranded_in_settings_json": bool(stranded),
             "vault_it_points_at": (registered or {}).get("env", {}).get("OBSIDIAN_VAULT"),
         },
         "hooks": {
             "script_exists": HOOK_SCRIPT.exists(),
             "project_scope": hooks_in(proj_settings),
             "user_scope": hooks_in(user_settings),
+        },
+        "project_rules": {
+            "path": str(rules_file),
+            "exists": rules_file.exists(),
+            "has_secbrain_section": has_rules,
+            "has_session_start_rule": has_rules and (
+                "Start every session by reading the vault" in rules_text),
         },
         "python": python_exe(),
     }
@@ -469,8 +516,16 @@ def cmd_doctor(args) -> int:
         problems.append("vault missing -- run: init")
     if not (report["mcp_server"]["registered_project"] or report["mcp_server"]["registered_user"]):
         problems.append("MCP server not registered -- run: install")
+    if report["mcp_server"]["stranded_in_settings_json"]:
+        problems.append(
+            f"an mcpServers block sits in {user_settings}, which Claude Code "
+            "does not read -- it is inert; re-run: install")
     if not (report["hooks"]["project_scope"] or report["hooks"]["user_scope"]):
         problems.append("capture hooks not registered -- run: install")
+    if not report["project_rules"]["has_session_start_rule"]:
+        problems.append(
+            "project rule file missing the context-first rule, so a new "
+            f"session will not search the vault -- run: install ({rules_file})")
     pointed = report["mcp_server"]["vault_it_points_at"]
     if pointed and Path(pointed).resolve() != vault:
         problems.append(f"registered server points at a different vault: {pointed}")
@@ -501,6 +556,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--client", default="auto",
                    choices=["auto", "all", *sorted(_clients.WRITERS)],
                    help="which agent client to configure (default: auto-detect)")
+    p.add_argument("--no-instructions", action="store_true",
+                   help="do not write the project rule file (CLAUDE.md) that "
+                        "tells the agent to search the vault before acting on "
+                        "the first request of a session")
     p.add_argument("--with-instructions", action="store_true",
                    help="also write AGENTS.md / copilot-instructions.md for "
                         "clients that have no session hooks")

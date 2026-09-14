@@ -1,6 +1,6 @@
 ---
 name: secbrain-init
-description: Set up the Obsidian second-brain MCP server for the current project - detect the OS and which agent client is in use (Claude Code, Codex, Copilot/VS Code, Cursor), create or reuse a local vault, register the server in that client's own config format, wire the capture hooks where the client supports them, then fire the hook and verify it actually wrote a note. Use when the user runs /secbrain-init, asks to set up / initialise / repair the second brain or its vault, asks whether it works with Codex or Copilot, or asks why session capture is not writing notes.
+description: Set up the Obsidian second-brain MCP server for the current project - detect the OS and which agent client is in use (Claude Code, Codex, Copilot/VS Code, Cursor), create or reuse a local vault, register the server in that client's own config format, wire the capture hooks where the client supports them, write the project rule that makes every new session search the vault before acting, then fire the hook and verify it actually wrote a note. Use when the user runs /secbrain-init, asks to set up / initialise / repair the second brain or its vault, asks whether it works with Codex or Copilot, or asks why session capture is not writing notes.
 disable-model-invocation: true
 ---
 
@@ -55,7 +55,7 @@ Key fields:
   that agent; `host` means it is only the editor hosting the terminal. Running
   Claude Code inside a VS Code terminal makes **both** look active — the
   `agent` signal is the one that identifies the driver.
-- `hooks_available_for` vs `manual_capture_only` — this determines Step 5.
+- `hooks_available_for` vs `manual_capture_only` — this determines Step 6.
 - `recommended_steps` — a plain list of what to do next.
 
 If `primary` is `null` with several clients present, **ask the user which one
@@ -75,6 +75,10 @@ Read `problems[]`, and pause on two findings before changing anything:
 - **`mcp_server.vault_it_points_at` differs from `vault.path`** — an earlier
   (often global) install points elsewhere. Say so and confirm before
   repointing; the user may be running one shared vault deliberately.
+
+`doctor` also reports `project_rules.has_session_start_rule`. False means the
+project has a wired-up vault that no session will ever read on its own — treat
+it as a real finding, not cosmetics, and fix it by re-running `install`.
 
 ## Step 3 — Create or reuse the vault
 
@@ -98,7 +102,8 @@ something to write by hand:
 
 | `--client` | File | Shape |
 |---|---|---|
-| `claude` | `.mcp.json` + `.claude/settings.local.json` | `mcpServers`, plus hooks |
+| `claude` (`--scope project`) | `.mcp.json` + `.claude/settings.local.json` | `mcpServers`, plus hooks |
+| `claude` (`--scope user`) | `~/.claude.json` + `~/.claude/settings.json` | `mcpServers` in the **first** file, hooks in the second |
 | `codex` | `~/.codex/config.toml` (`--scope project` → `.codex/config.toml`) | TOML `[mcp_servers.NAME]` |
 | `vscode` | `.vscode/mcp.json` | `servers` (**not** `mcpServers`), needs `"type": "stdio"` |
 | `copilot` | workspace `.mcp.json` | `mcpServers` — the Agent Host does not read `.vscode/mcp.json` |
@@ -113,9 +118,62 @@ replaced on re-run, so it never stacks.
 Existing entries, comments and unrelated servers are preserved everywhere, and
 every file is backed up before rewriting.
 
-## Step 5 — Verify, do not assume
+**The two Claude scopes use two different files, and `settings.json` is not one
+of them for servers.** `~/.claude/settings.json` holds hooks, permissions, model
+and plugins; it has no `mcpServers` key, so a server written there is an unknown
+key that Claude Code drops without an error anywhere — the hooks in the same
+file keep working, which makes the install look successful. User-scoped servers
+live in `~/.claude.json`. `install` now writes each to its own file and strips
+any inert `mcpServers` block an older install left in `settings.json`, reporting
+that in `caveats`. If you are choosing the scope for the user: `project` keeps
+the vault with the project and is the default; `user` makes it available in
+every project.
 
-**If the client supports hooks (`claude`):**
+## Step 5 — The context-first rule lands in the project
+
+`install` also writes the marked `<!-- secbrain:start -->` block into the
+project's rule file: `CLAUDE.md` for Claude Code — written every time, no flag
+needed — and `AGENTS.md`, `.github/copilot-instructions.md` or
+`.cursor/rules/secbrain.md` for the clients that took `--with-instructions` in
+Step 4. The block leads with the rule that has to fire first:
+
+> **Before acting on the user's first request in a session, search the vault**
+> — `search_notes` on the terms of the request, `find_notes` on the obvious
+> titles, `vault_info` for the taxonomy — and read the results before opening a
+> file, running a command, or answering.
+
+This is not redundant with the hooks, and it is the reason Claude Code gets a
+rule file even though it is the one client that needs no manual capture. A hook
+*writes* the vault when a session **ends**; nothing otherwise makes the agent
+*read* it when a session **begins**. Without the block, every new session starts
+with an empty head beside a full vault, and the second brain only ever
+accumulates.
+
+The block is marked, so a re-run replaces it instead of stacking, and the rest
+of the file is untouched — a `.bak-<timestamp>` is written first either way.
+Check `project_rules` in the `install` output for the path it landed in.
+
+Pass `--no-instructions` only when the user keeps project rules somewhere the
+tool should not touch. Then say so plainly: the rule is not installed, and no
+session will read the vault on its own until they paste it in themselves.
+
+## Step 6 — Verify, do not assume
+
+**First, verify the registration landed in a file the client reads.** Re-run
+`doctor` and check three fields before anything else:
+
+- `mcp_server.registered_project` / `registered_user` — at least one must be
+  true for the scope you installed. Both false means the server will not
+  connect, whatever else passed.
+- `mcp_server.stranded_in_settings_json` — true means a server is sitting in
+  `~/.claude/settings.json`, where it is inert. Re-run `install`.
+
+This check exists because the rest of Step 6 cannot catch a bad registration.
+`test-hook` verifies the *hook*, and the hook lives in a different file from the
+server, so it passes 7/7 with the server misfiled. Never report the setup as
+working on the strength of the hook result alone.
+
+**Then, if the client supports hooks (`claude`):**
 
 ```
 "$PY" -m obsidian_secondbrain.cli test-hook --project "<root>"
@@ -149,23 +207,28 @@ capture is unavailable on that client, confirm `--with-instructions` wrote the
 guidance file, and tell the user that sessions are recorded only when the agent
 calls `capture_session` (or the `compact_to_vault` prompt where supported).
 
-## Step 6 — Confirm and hand off
+## Step 7 — Confirm and hand off
 
 Re-run `doctor` and confirm `ok: true`. Then report concretely:
 
 - the OS, and which client was detected — **with the evidence**, not just the name
 - which vault is in use, created or reused
 - which files were written, in which format
+- **which file the server itself was registered in**, and that `doctor` reads it
+  back as registered — name the path, so a wrong one is visible at a glance
 - the hook result as `N/7`, or an explicit "no automatic capture on this client"
+- which rule file carries the context-first block, and that it takes effect
+  on the **next** session, not this one
 - **that the client must be restarted** before the MCP tools appear
 
 The tools are named `mcp__obsidian-secondbrain__*` and will not exist in the
 current session, because MCP servers connect at startup. Do not claim they are
-available, and do not call them to "verify" — Step 5 is the verification.
+available, and do not call them to "verify" — Step 6 is the verification.
 
 ## Afterwards
 
-The workflow: `log_entry` to capture, `capture_session` (or `/compact_to_vault`)
+Every session now opens with a vault search — that is the installed rule, not
+a habit to remember. The rest of the workflow: `log_entry` to capture, `capture_session` (or `/compact_to_vault`)
 to compact, `distill_queue` → `create_concept_note` → `mark_distilled` to
 distil, `vault_health` to see what needs attention. The folder taxonomy is data
 in `<vault>/.secondbrain/config.json` — reshape it there, not in code.

@@ -145,6 +145,21 @@ def write_cursor(project: Path, py: str, vault: str) -> dict:
 AGENTS_SECTION_START = "<!-- secbrain:start -->"
 AGENTS_SECTION_END = "<!-- secbrain:end -->"
 
+SESSION_START_RULE = """\
+## Start every session by reading the vault
+
+Before you act on the user's first request in a session, search the vault --
+`search_notes` on the key terms of the request, `find_notes` on the obvious
+titles, `vault_info` if you do not yet know the folder taxonomy. Read what
+comes back *before* you open a file, run a command, or answer. What was decided
+and why, what is still open and what was already tried live in there;
+re-deriving them throws away the work that put them there.
+
+Do this once per session, on the first request, whatever the request is. If
+nothing relevant comes back, say so in one line and carry on -- an empty vault
+is an answer, not a blocker.
+"""
+
 AGENTS_BODY = """\
 ## Second brain (obsidian-secondbrain MCP)
 
@@ -165,13 +180,48 @@ Never edit a raw capture -- distil it instead. Never write an unlinked note:
 the folder taxonomy; it is configurable data, not fixed.
 """
 
+CLAUDE_BODY = """\
+## Second brain (obsidian-secondbrain MCP)
 
-def write_instructions(path: Path) -> dict:
-    """Give non-Claude clients the guidance the skill gives Claude Code.
+This project has a local Obsidian vault wired up over MCP. The server only
+moves bytes on disk -- it never summarises. The thinking is yours.
+
+- **Capture** as you go: `log_entry` for a fact or half-formed idea.
+- **Compact** happens on its own: the `PreCompact` and `SessionEnd` hooks file
+  the raw session into the inbox, undistilled. Still call `capture_session`
+  with a written summary when a session decided something worth keeping -- a
+  hook runs outside the model and cannot summarise.
+- **Distil** when asked: `distill_queue` -> `create_concept_note` (one idea per
+  note, title phrased as a claim, linked with [[wikilinks]]) -> `mark_distilled`.
+- **Review**: `vault_health`, `related_notes`, `resurface_notes`.
+
+Never edit a raw capture -- distil it instead. Never write an unlinked note:
+`find_notes` or `search_notes` first, then link. Run `vault_info` once to learn
+the folder taxonomy; it is configurable data, not fixed.
+"""
+
+
+def instruction_body(client: str) -> str:
+    """The guidance block for `client`, context-first rule on top.
+
+    The rule leads because it is the only part that has to fire before the
+    agent does anything else; capture and distillation keep until later.
+    """
+    body = CLAUDE_BODY if client == "claude" else AGENTS_BODY
+    return SESSION_START_RULE + "\n" + body
+
+
+def write_instructions(path: Path, client: str = "codex") -> dict:
+    """Write the per-session guidance into `client`'s instruction file.
+
+    Every client gets it, Claude Code included: hooks only *write* to the
+    vault at the end of a session, so without this nothing makes an agent
+    *read* it at the start of one.
 
     Idempotent: replaces the marked block, leaves the rest of the file alone.
     """
-    section = f"{AGENTS_SECTION_START}\n{AGENTS_BODY}{AGENTS_SECTION_END}\n"
+    section = (f"{AGENTS_SECTION_START}\n{instruction_body(client)}"
+               f"{AGENTS_SECTION_END}\n")
     existing = path.read_text(encoding="utf-8") if path.exists() else ""
     written = []
     b = _backup(path)
@@ -194,6 +244,7 @@ def write_instructions(path: Path) -> dict:
 
 
 INSTRUCTION_FILE = {
+    "claude": lambda project: project / "CLAUDE.md",
     "codex": lambda project: project / "AGENTS.md",
     "vscode": lambda project: project / ".github" / "copilot-instructions.md",
     "copilot": lambda project: project / ".github" / "copilot-instructions.md",
