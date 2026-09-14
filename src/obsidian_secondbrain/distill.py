@@ -82,9 +82,10 @@ def create_concept_note(
     overwrite: bool = False,
 ) -> dict:
     """One atomic note = one idea, stated as a claim in the title/first line."""
-    from .capture import slugify
+    from .capture import title_filename
 
-    rel = f"{cfg.folders['notes']}/{slugify(title)}{cfg.ext}"
+    # Filename == title, so [[title]] from any other note resolves here.
+    rel = f"{cfg.folders['notes']}/{title_filename(title)}{cfg.ext}"
     fm = {
         "type": "concept",
         "title": title,
@@ -135,9 +136,9 @@ def health(cfg: VaultConfig) -> dict:
 def build_map(cfg: VaultConfig, topic: str, note_paths: list[str],
               intro: str = "") -> dict:
     """Write a Map-of-Content index note the agent has curated."""
-    from .capture import slugify
+    from .capture import title_filename
 
-    rel = f"{cfg.folders['maps']}/{slugify(topic)}{cfg.ext}"
+    rel = f"{cfg.folders['maps']}/{title_filename(topic)}{cfg.ext}"
     lines = [f"# {topic}", ""]
     if intro.strip():
         lines += [intro.strip(), ""]

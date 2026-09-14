@@ -14,12 +14,29 @@ from .config import VaultConfig
 from .vault import Note, append_note, write_note
 
 SLUG_RE = re.compile(r"[^\w֐-׿ -]+", re.UNICODE)
+# Characters Windows and/or Obsidian refuse in a filename.
+ILLEGAL_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 
 def slugify(text: str, max_len: int = 60) -> str:
+    """Hyphenated slug -- for names that are not wikilink targets."""
     text = SLUG_RE.sub("", (text or "").strip())
     text = re.sub(r"\s+", "-", text).strip("-")
     return (text[:max_len].rstrip("-") or "untitled")
+
+
+def title_filename(title: str, max_len: int = 120) -> str:
+    """Filename that preserves the title verbatim, minus illegal characters.
+
+    Obsidian resolves [[Some title]] to a file literally named "Some title.md",
+    so a note that is a link target must keep its spaces -- slugifying it here
+    would silently break every backlink pointing at it.
+    """
+    name = ILLEGAL_RE.sub("", (title or "").strip())
+    name = re.sub(r"\s+", " ", name).strip()
+    # Windows rejects a trailing dot or space.
+    name = name[:max_len].rstrip(". ")
+    return name or "untitled"
 
 
 def daily_note_rel(cfg: VaultConfig, date: str | None = None) -> str:
@@ -57,7 +74,9 @@ def capture_session(
     """Write one session note and cross-post a pointer into the daily log."""
     now = _dt.datetime.now()
     fmt = cfg.get("session_note_format", "%Y-%m-%d-%H%M")
-    name = f"{now.strftime(fmt)}-{slugify(title)}"
+    # Session notes are linked by this exact stem from the daily log, so the
+    # name only has to be self-consistent, not equal to the title.
+    name = f"{now.strftime(fmt)} {title_filename(title, 80)}"
     rel = f"{cfg.folders['sessions']}/{name}{cfg.ext}"
 
     fm = {
