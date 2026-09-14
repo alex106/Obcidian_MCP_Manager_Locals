@@ -24,6 +24,40 @@ to skip automatic session capture.
 
 First thing in a fresh vault: ask the agent to call `init_vault`.
 
+## Quick setup: the `secbrain-init` skill
+
+Copy `skills/secbrain-init/` into `~/.claude/skills/`, restart Claude Code, and
+run `/secbrain-init` in any project. It creates or reuses a vault there,
+registers the server and hooks for that project, fires the capture hook and
+verifies it wrote a note, then reports.
+
+The skill drives the CLI below rather than editing config by hand, so setup is
+tested code and behaves the same every time.
+
+## CLI
+
+```bash
+PY=.venv/Scripts/python.exe    # or .venv/bin/python
+
+$PY -m obsidian_secondbrain.cli doctor    --project .   # what is / isn't set up
+$PY -m obsidian_secondbrain.cli init      --project .   # create or reuse the vault
+$PY -m obsidian_secondbrain.cli install   --project .   # register server + hooks
+$PY -m obsidian_secondbrain.cli test-hook --project .   # fire the hook, verify, clean up
+```
+
+Each prints one JSON object and exits non-zero on failure. `init` and
+`install` are idempotent: existing notes are never touched, config files are
+backed up before rewriting, unrelated entries are preserved, and re-running
+replaces this hook rather than stacking duplicates.
+
+`install --scope project` (default) writes `.mcp.json` plus
+`.claude/settings.local.json` — hooks go in the local file because they embed
+absolute machine paths. `--scope user` registers one vault globally instead.
+
+`test-hook` is the one that matters: it writes a synthetic transcript, runs the
+real hook against the real vault, asserts six properties of the note it
+produced, then restores the vault byte-for-byte.
+
 ## Configuration
 
 Exactly one input: the `OBSIDIAN_VAULT` environment variable, set in the MCP
@@ -113,6 +147,9 @@ src/obsidian_secondbrain/
   capture.py   daily log, session notes
   distill.py   distill queue, concept notes, health, maps
   server.py    MCP tool + prompt surface
+  cli.py       doctor / init / install / test-hook bootstrap
 hooks/capture_session.py    PreCompact / SessionEnd raw capture
-scripts/install.py          settings.json registration
+scripts/install.py          settings.json registration (user scope)
+skills/secbrain-init/       Claude Code skill: /secbrain-init
+tests/test_lifecycle.py     34 assertions over a real stdio MCP client
 ```
