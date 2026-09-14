@@ -21,8 +21,11 @@ def check(name, cond, detail=""):
 
 
 def cli(*a):
+    # encoding='utf-8' matters: text=True alone decodes with the locale
+    # codec (cp1252 on Windows), which mangles non-ASCII paths into mojibake
+    # that still parses as JSON -- a silently wrong read, not an error.
     p = subprocess.run([str(PY), "-m", "obsidian_secondbrain.cli", *a],
-                       capture_output=True, text=True, cwd=str(REPO))
+                       capture_output=True, text=True, encoding="utf-8", cwd=str(REPO))
     try:
         return json.loads(p.stdout)
     except json.JSONDecodeError:
@@ -108,6 +111,21 @@ try:
           any("no session hooks" in c for c in r.get("caveats", [])), r.get("caveats"))
     check("no hooks were registered for a hookless client",
           "hooks" not in r or not r.get("hooks"), r.get("hooks"))
+    # ------------------------------------------------------ non-ASCII paths --
+    print("\n[Unicode] a project path outside cp1252 must not break the CLI")
+    uni = Path(tempfile.mkdtemp(prefix="clients-")) / "פינוי בינוי — café"
+    uni.mkdir(parents=True)
+    try:
+        r = cli("init", "--project", str(uni))
+        check("init works under a Hebrew/accented path", r.get("ok") is True,
+              r.get("_stderr", r)),
+        r = cli("detect", "--project", str(uni))
+        check("detect works under a Hebrew/accented path", r.get("ok") is True,
+              r.get("_stderr", r))
+        check("the path survives the round trip",
+              "פינוי" in r.get("project", ""), r.get("project"))
+    finally:
+        shutil.rmtree(uni.parent, ignore_errors=True)
 finally:
     shutil.rmtree(proj, ignore_errors=True)
 

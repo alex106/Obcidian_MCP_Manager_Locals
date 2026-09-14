@@ -12,8 +12,11 @@ HOOK = REPO / "hooks" / "capture_session.py"
 
 
 def cli(*a):
+    # encoding='utf-8' matters: text=True alone decodes with the locale
+    # codec (cp1252 on Windows), which mangles non-ASCII paths into mojibake
+    # that still parses as JSON -- a silently wrong read, not an error.
     p = subprocess.run([str(PY), "-m", "obsidian_secondbrain.cli", *a],
-                       capture_output=True, text=True, cwd=str(REPO))
+                       capture_output=True, text=True, encoding="utf-8", cwd=str(REPO))
     try:
         return json.loads(p.stdout), p.returncode
     except json.JSONDecodeError:

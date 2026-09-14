@@ -39,7 +39,19 @@ DEFAULT_VAULT_DIRNAME = "SecondBrain"
 # ------------------------------------------------------------------ utils --
 
 def out(payload: dict, ok: bool = True) -> int:
-    print(json.dumps(payload, indent=2, ensure_ascii=False, default=str))
+    """Emit JSON as UTF-8 bytes, not through the console's default codec.
+
+    On Windows a piped stdout defaults to cp1252, so a project or vault path
+    containing Hebrew, Cyrillic, CJK or accented characters would raise
+    UnicodeEncodeError and take down every subcommand.
+    """
+    text = json.dumps(payload, indent=2, ensure_ascii=False, default=str)
+    buf = getattr(sys.stdout, "buffer", None)
+    if buf is not None:
+        buf.write(text.encode("utf-8") + b"\n")
+        buf.flush()
+    else:  # a wrapped stream in tests
+        print(text)
     return 0 if ok else 1
 
 
