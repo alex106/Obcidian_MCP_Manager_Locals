@@ -20,7 +20,9 @@ JSON object and exits non-zero on failure.
 
 Find the `obsidian-mcp` checkout, in order:
 
-1. `C:/Users/posti/Documents/obsidian-mcp`
+1. `~/Documents/obsidian-mcp` — the current user's home, never a hard-coded
+   username (`$env:USERPROFILE\Documents\obsidian-mcp` on Windows,
+   `$HOME/Documents/obsidian-mcp` elsewhere)
 2. A sibling of the current project named `obsidian-mcp`
 3. `git clone https://github.com/alex106/Obcidian_MCP_Manager_Locals` if the
    user wants a fresh install — then create `.venv` and `pip install -e .`
