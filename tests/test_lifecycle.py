@@ -8,8 +8,9 @@ from pathlib import Path
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-PROJECT = Path(r"C:\Users\posti\Documents\obsidian-mcp")
-PY = PROJECT / ".venv/Scripts/python.exe"
+PROJECT = Path(__file__).resolve().parents[1]  # repo root, wherever it is cloned
+_VENV = PROJECT / ".venv"
+PY = _VENV / "Scripts" / "python.exe" if (_VENV / "Scripts").is_dir() else _VENV / "bin" / "python"
 
 PASS, FAIL = [], []
 

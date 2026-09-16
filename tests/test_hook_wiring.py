@@ -6,8 +6,9 @@ registration that has no --vault.
 import json, os, shutil, subprocess, sys, tempfile
 from pathlib import Path
 
-REPO = Path(r"C:\Users\posti\Documents\obsidian-mcp")
-PY = REPO / ".venv/Scripts/python.exe"
+REPO = Path(__file__).resolve().parents[1]  # repo root, wherever it is cloned
+_VENV = REPO / ".venv"
+PY = _VENV / "Scripts" / "python.exe" if (_VENV / "Scripts").is_dir() else _VENV / "bin" / "python"
 HOOK = REPO / "hooks" / "capture_session.py"
 
 
