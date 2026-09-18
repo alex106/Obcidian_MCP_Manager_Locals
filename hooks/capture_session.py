@@ -23,10 +23,12 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
-import os
 import re
 import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _common import resolve_vault  # noqa: E402
 
 MAX_CHARS = 20000
 SLUG_RE = re.compile(r"[^\w -]+", re.UNICODE)
@@ -74,39 +76,6 @@ def read_transcript(path: str) -> list[tuple[str, str]]:
             continue
         turns.append((role, body))
     return turns
-
-
-def looks_like_vault(p: Path) -> bool:
-    return p.is_dir() and (
-        (p / ".obsidian").is_dir() or (p / ".secondbrain" / "config.json").exists()
-    )
-
-
-def resolve_vault(payload: dict) -> Path | None:
-    """--vault, then $OBSIDIAN_VAULT, then a vault beside the project."""
-    argv = sys.argv[1:]
-    for i, a in enumerate(argv):
-        if a == "--vault" and i + 1 < len(argv):
-            candidate = argv[i + 1]
-            break
-        if a.startswith("--vault="):
-            candidate = a.split("=", 1)[1]
-            break
-    else:
-        candidate = os.environ.get("OBSIDIAN_VAULT")
-
-    if candidate:
-        p = Path(os.path.expandvars(os.path.expanduser(candidate)))
-        return p if p.is_dir() else None
-
-    # Last resort: a vault sitting in the project directory.
-    base = payload.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR")
-    if base:
-        for name in ("SecondBrain", "secondbrain"):
-            p = Path(base) / name
-            if looks_like_vault(p):
-                return p
-    return None
 
 
 def main() -> int:

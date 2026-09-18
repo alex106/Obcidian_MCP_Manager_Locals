@@ -73,18 +73,29 @@ an agent writing its own summary and filing it works anywhere. `install
 --with-instructions` writes `AGENTS.md` / `.github/copilot-instructions.md` /
 `.cursor/rules/secbrain.md` so those agents know to call it.
 
-### The context-first rule
+### Reading the vault at the start of a session
+
+Two mechanisms cover this, and they are deliberately not the same thing.
+
+A `SessionStart` hook (`hooks/session_start.py`, Claude Code only) fires
+unconditionally on every session start/resume/clear/compact and injects a
+small, passive digest as `additionalContext` — the undistilled backlog count
+and the tail of the most recent log. It never searches anything; it can't,
+because the user's actual request doesn't exist yet at that point.
 
 `install` also writes a marked block into the project's rule file — `CLAUDE.md`
 for Claude Code, with no flag needed — whose first instruction is: **before
-acting on the first request of a session, search the vault**.
+acting on the first request of a session, search the vault**. This is the
+*active* half: a targeted `search_notes`/`find_notes` once the request is
+known, which a hook firing before any user text exists structurally cannot do.
 
-Claude Code gets this even though it needs no manual capture, because the two
-solve opposite halves of the problem. A hook *writes* the vault when a session
-**ends**; nothing otherwise makes an agent *read* it when a session **begins**.
-Without the rule the vault only ever fills up, and every session starts by
-re-deriving what is already written down. `doctor` reports
-`project_rules.has_session_start_rule`, and `--no-instructions` opts out.
+Every client gets the rule, Claude Code included, because a capture hook only
+*writes* the vault when a session **ends** — without the rule (or, for Claude
+Code, on top of the hook's passive digest), the vault only ever fills up, and
+a session starts by re-deriving what is already written down. `doctor` reports
+`project_rules.has_session_start_rule` and `hooks.missing` (which lists any of
+`PreCompact`/`SessionEnd`/`SessionStart` not yet registered), and
+`--no-instructions` opts out of the rule file specifically.
 
 `detect` identifies the client from evidence and distinguishes an `agent`
 signal (we are running as it) from a `host` signal (it is merely the editor
@@ -146,7 +157,8 @@ titled as a claim, linked into the existing graph. Review fights the
 write-only vault.
 
 ```
-CAPTURE  →  log_entry, append_to_note, the SessionEnd hook
+INJECT   →  the SessionStart hook (Claude Code) + the context-first rule
+CAPTURE  →  log_entry, append_to_note, the PreCompact/SessionEnd hooks
 COMPACT  →  capture_session   (agent writes the summary, server files it)
 DISTILL  →  distill_queue → create_concept_note → mark_distilled
 REVIEW   →  vault_health, resurface_notes, related_notes, stale_notes
@@ -187,6 +199,11 @@ undistilled note. The next `distill_queue` call hands that to the agent, which
 does the thinking. Automatic capture without ever needing a model behind the
 server's back.
 
+The `SessionStart` hook (`hooks/session_start.py`) is the same idea run in
+reverse: it can't summarise either, so it just counts and quotes — the
+undistilled backlog size and the tail of the latest log — and hands that back
+as `additionalContext`. Injection without a model in the hook, same as capture.
+
 The hook always exits 0. A failed capture never blocks your session.
 
 ## Safety
@@ -211,6 +228,8 @@ src/obsidian_secondbrain/
   environment.py  evidence-based OS + client detection
   clients.py      per-client config writers (json / toml shapes)
 hooks/capture_session.py    PreCompact / SessionEnd raw capture
+hooks/session_start.py      SessionStart digest injection
+hooks/_common.py            shared vault resolution for both hook scripts
 scripts/install.py          user-scope registration (~/.claude.json + settings.json)
 skills/secbrain-init/       Claude Code skill: /secbrain-init
 tests/test_lifecycle.py     34 assertions over a real stdio MCP client

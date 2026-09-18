@@ -144,12 +144,15 @@ Step 4. The block leads with the rule that has to fire first:
 > titles, `vault_info` for the taxonomy — and read the results before opening a
 > file, running a command, or answering.
 
-This is not redundant with the hooks, and it is the reason Claude Code gets a
-rule file even though it is the one client that needs no manual capture. A hook
-*writes* the vault when a session **ends**; nothing otherwise makes the agent
-*read* it when a session **begins**. Without the block, every new session starts
-with an empty head beside a full vault, and the second brain only ever
-accumulates.
+This is not redundant with the hooks. For Claude Code, `install` also wires a
+`SessionStart` hook that injects a passive digest (undistilled backlog count,
+recent log tail) into every new session unconditionally — but that hook fires
+before the user's request exists, so it cannot search anything. The rule block
+is the *active* half: a targeted `search_notes`/`find_notes` once the request
+is known. Every other client still needs the rule for the reason it always
+did: a capture hook only *writes* the vault when a session **ends**; without
+the rule nothing makes the agent *read* it when a session **begins**, and the
+second brain only ever accumulates.
 
 The block is marked, so a re-run replaces it instead of stacking, and the rest
 of the file is untouched — a `.bak-<timestamp>` is written first either way.
@@ -171,8 +174,8 @@ session will read the vault on its own until they paste it in themselves.
   `~/.claude/settings.json`, where it is inert. Re-run `install`.
 
 This check exists because the rest of Step 6 cannot catch a bad registration.
-`test-hook` verifies the *hook*, and the hook lives in a different file from the
-server, so it passes 7/7 with the server misfiled. Never report the setup as
+`test-hook` verifies the *hooks*, and they live in different files from the
+server, so it passes 11/11 with the server misfiled. Never report the setup as
 working on the strength of the hook result alone.
 
 **Then, if the client supports hooks (`claude`):**
@@ -181,26 +184,36 @@ working on the strength of the hook result alone.
 "$PY" -m obsidian_secondbrain.cli test-hook --project "<root>"
 ```
 
-It writes a synthetic transcript, then runs **the command exactly as registered
-in settings**, in an environment with `OBSIDIAN_VAULT` deliberately stripped —
-what a real session gives a hook. Seven checks: a hook is registered at all, it
-exits 0, it wrote exactly one inbox note, the note carries the transcript text,
-it is marked `distilled: false`, tool-call noise was excluded, and the daily log
-got a pointer. It then restores the vault byte-for-byte.
+It writes a synthetic transcript, then runs **the commands exactly as
+registered in settings**, in an environment with `OBSIDIAN_VAULT` deliberately
+stripped — what a real session gives a hook. Eleven checks across the two
+hooks:
 
-Running the *registered* command under a *stripped* environment is the whole
+- **Capture (`SessionEnd`, 7 checks)**: the hook is registered, exits 0, wrote
+  exactly one inbox note, the note carries the transcript text, it is marked
+  `distilled: false`, tool-call noise was excluded, and the daily log got a
+  pointer. It then restores the vault byte-for-byte.
+- **Injection (`SessionStart`, 4 checks)**: the hook is registered, exits 0,
+  emits `hookSpecificOutput.additionalContext` on stdout, and that digest
+  mentions the undistilled count. No vault side-effect is expected here — a
+  digest is read-only.
+
+Running the *registered* commands under a *stripped* environment is the whole
 point. A hook does **not** inherit the `env` block of an MCP server config, so a
-hook registered without `--vault` finds no vault, exits 0 and silently writes
-nothing. A test that synthesises its own command, or injects `OBSIDIAN_VAULT`,
+hook registered without `--vault` finds no vault, exits 0 and (for the capture
+hook) silently writes nothing, or (for the injection hook) silently emits no
+digest. A test that synthesises its own command, or injects `OBSIDIAN_VAULT`,
 will happily pass a hook that does nothing in practice.
 
 | Failing check | Likely cause |
 |---|---|
-| hook is registered in settings | `install` never ran, or wrote to another scope |
+| capture hook is registered in settings | `install` never ran, or wrote to another scope |
+| SessionStart hook is registered in settings | same, or `install` ran before this feature existed — re-run `install` |
 | hook exits 0 | wrong interpreter, or package not installed in that venv |
 | wrote exactly one inbox note | registered command missing `--vault` (old install) — re-run `install` |
 | note carries transcript text | transcript format changed — check `read_transcript` |
 | daily log got a pointer | log folder renamed in `config.json` |
+| SessionStart hook emits additionalContext | registered command missing `--vault`, or `obsidian_secondbrain` not importable from that interpreter |
 
 **If the client does not support hooks** (`codex`, `vscode`, `copilot`,
 `cursor`): do **not** run `test-hook` — there is nothing to test, and saying
@@ -218,7 +231,7 @@ Re-run `doctor` and confirm `ok: true`. Then report concretely:
 - which files were written, in which format
 - **which file the server itself was registered in**, and that `doctor` reads it
   back as registered — name the path, so a wrong one is visible at a glance
-- the hook result as `N/7`, or an explicit "no automatic capture on this client"
+- the hook result as `N/11`, or an explicit "no automatic capture on this client"
 - which rule file carries the context-first block, and that it takes effect
   on the **next** session, not this one
 - **that the client must be restarted** before the MCP tools appear

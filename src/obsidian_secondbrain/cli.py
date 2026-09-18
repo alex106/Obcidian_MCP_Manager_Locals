@@ -31,8 +31,18 @@ from .environment import detect_all
 PACKAGE_ROOT = Path(__file__).resolve().parent
 PROJECT_ROOT = PACKAGE_ROOT.parent.parent          # the obsidian-mcp checkout
 HOOK_SCRIPT = PROJECT_ROOT / "hooks" / "capture_session.py"
+SESSION_START_SCRIPT = PROJECT_ROOT / "hooks" / "session_start.py"
 SERVER_KEY = "obsidian-secondbrain"
-HOOK_EVENTS = ("PreCompact", "SessionEnd")
+# Each event's own script -- SessionStart injects a digest, the other two
+# capture. Every place that used to assume "one script for every event" is
+# keyed off this map instead, so a broken or missing SessionStart entry is
+# just as visible to doctor/test-hook as a broken capture hook.
+HOOK_SCRIPTS: dict[str, Path] = {
+    "PreCompact": HOOK_SCRIPT,
+    "SessionEnd": HOOK_SCRIPT,
+    "SessionStart": SESSION_START_SCRIPT,
+}
+HOOK_EVENTS = tuple(HOOK_SCRIPTS)
 
 # Claude Code reads user-scoped MCP servers from ~/.claude.json, and hooks from
 # ~/.claude/settings.json. They are different files with different schemas:
@@ -211,8 +221,9 @@ def cmd_install(args) -> int:
     vault = vault_dir(project, args.vault)
     if not vault.is_dir():
         return out({"ok": False, "error": f"vault does not exist: {vault}. Run init first."}, False)
-    if not HOOK_SCRIPT.exists():
-        return out({"ok": False, "error": f"hook script missing: {HOOK_SCRIPT}"}, False)
+    missing_scripts = [str(s) for s in set(HOOK_SCRIPTS.values()) if not s.exists()]
+    if missing_scripts:
+        return out({"ok": False, "error": f"hook script(s) missing: {missing_scripts}"}, False)
 
     py = python_exe()
     vault_s = str(vault).replace("\\", "/")
@@ -260,8 +271,9 @@ def cmd_install(args) -> int:
     # The vault must be passed on the command line: a hook does NOT inherit the
     # MCP server's `env` block, so relying on OBSIDIAN_VAULT here would make the
     # hook a silent no-op.
-    hook_cmd = f'"{py}" "{HOOK_SCRIPT}" --vault "{vault_s}"'
-    hook_entry = [{"hooks": [{"type": "command", "command": hook_cmd, "timeout": 15}]}]
+    def hook_entry_for(script: Path) -> list[dict]:
+        cmd = f'"{py}" "{script}" --vault "{vault_s}"'
+        return [{"hooks": [{"type": "command", "command": cmd, "timeout": 15}]}]
 
     if args.scope == "project":
         # .mcp.json is the project-scoped MCP config Claude Code reads.
@@ -294,10 +306,10 @@ def cmd_install(args) -> int:
                      f"(the server belongs in {mcp_path})")
 
     if not args.no_hooks:
-        for event in HOOK_EVENTS:
+        for event, script in HOOK_SCRIPTS.items():
             bucket = settings.setdefault("hooks", {}).setdefault(event, [])
-            kept = [h for h in bucket if "capture_session.py" not in json.dumps(h)]
-            settings["hooks"][event] = kept + hook_entry
+            kept = [h for h in bucket if script.name not in json.dumps(h)]
+            settings["hooks"][event] = kept + hook_entry_for(script)
 
     write_json(settings_path, settings)
     changed.append(str(settings_path))
@@ -339,17 +351,17 @@ SYNTH_TRANSCRIPT = [
 ]
 
 
-def registered_hook_command(project: Path) -> str | None:
-    """The capture hook command as actually registered, project scope first."""
+def registered_hook_command(project: Path, event: str) -> str | None:
+    """The command actually registered for one hook event, project scope first."""
+    script_name = HOOK_SCRIPTS[event].name
     for path in (project / ".claude" / "settings.local.json",
                  project / ".claude" / "settings.json",
                  Path.home() / ".claude" / "settings.json"):
         settings = read_json(path)
-        for event in HOOK_EVENTS:
-            for entry in settings.get("hooks", {}).get(event, []):
-                for h in entry.get("hooks", []):
-                    if "capture_session.py" in h.get("command", ""):
-                        return h["command"]
+        for entry in settings.get("hooks", {}).get(event, []):
+            for h in entry.get("hooks", []):
+                if script_name in h.get("command", ""):
+                    return h["command"]
     return None
 
 
@@ -359,8 +371,9 @@ def cmd_test_hook(args) -> int:
     vault = vault_dir(project, args.vault)
     if not vault.is_dir():
         return out({"ok": False, "error": f"vault does not exist: {vault}. Run init first."}, False)
-    if not HOOK_SCRIPT.exists():
-        return out({"ok": False, "error": f"hook script missing: {HOOK_SCRIPT}"}, False)
+    missing_scripts = [str(s) for s in set(HOOK_SCRIPTS.values()) if not s.exists()]
+    if missing_scripts:
+        return out({"ok": False, "error": f"hook script(s) missing: {missing_scripts}"}, False)
 
     inbox = vault / DEFAULT_CONFIG["folders"]["inbox"]
     cfg_file = vault / ".secondbrain" / "config.json"
@@ -398,8 +411,8 @@ def cmd_test_hook(args) -> int:
     # OBSIDIAN_VAULT stripped -- which is what a real Claude Code session gives
     # a hook. Synthesising a command here, or injecting the env var, would let a
     # hook that is a no-op in practice pass this test.
-    registered = registered_hook_command(project)
-    record("hook is registered in settings", registered is not None,
+    registered = registered_hook_command(project, "SessionEnd")
+    record("capture hook is registered in settings", registered is not None,
            "no capture_session.py hook found in project or user settings")
     env = {k: v for k, v in os.environ.items() if k != "OBSIDIAN_VAULT"}
     env["CLAUDE_PROJECT_DIR"] = str(project)
@@ -439,6 +452,38 @@ def cmd_test_hook(args) -> int:
             today_log.write_bytes(log_before)
         shutil.rmtree(tmp, ignore_errors=True)
 
+    # --- SessionStart: injection, not capture. No transcript, no vault
+    # side-effect expected -- it must only print a hookSpecificOutput digest.
+    start_registered = registered_hook_command(project, "SessionStart")
+    record("SessionStart hook is registered in settings", start_registered is not None,
+           "no session_start.py hook found in project or user settings")
+
+    start_payload = {
+        "session_id": "secbrain-selftest",
+        "cwd": str(project),
+        "hook_event_name": "SessionStart",
+        "source": "startup",
+    }
+    start_cmd = start_registered or f'"{python_exe()}" "{SESSION_START_SCRIPT}" --vault "{vault}"'
+    start_proc = subprocess.run(
+        start_cmd, shell=True,
+        input=json.dumps(start_payload), text=True, capture_output=True, timeout=30,
+        env=env,
+    )
+    record("SessionStart hook exits 0", start_proc.returncode == 0,
+           f"rc={start_proc.returncode} stderr={start_proc.stderr.strip()[:300]}")
+
+    start_out = {}
+    try:
+        start_out = json.loads(start_proc.stdout.strip() or "{}")
+    except json.JSONDecodeError:
+        pass
+    digest = start_out.get("hookSpecificOutput", {}).get("additionalContext", "")
+    record("SessionStart hook emits hookSpecificOutput.additionalContext",
+           bool(digest), f"stdout={start_proc.stdout.strip()[:200]!r}")
+    record("SessionStart digest mentions the vault's undistilled count",
+           "undistilled" in digest.lower())
+
     passed = [c for c in checks if c["ok"]]
     ok = len(passed) == len(checks)
     return out({
@@ -463,8 +508,8 @@ def cmd_doctor(args) -> int:
 
     def hooks_in(path: Path) -> list[str]:
         s = read_json(path)
-        return [e for e in HOOK_EVENTS
-                if "capture_session.py" in json.dumps(s.get("hooks", {}).get(e, []))]
+        return [e for e, script in HOOK_SCRIPTS.items()
+                if script.name in json.dumps(s.get("hooks", {}).get(e, []))]
 
     def server_in(path: Path) -> dict | None:
         servers = read_json(path).get("mcpServers")
@@ -497,9 +542,11 @@ def cmd_doctor(args) -> int:
             "vault_it_points_at": (registered or {}).get("env", {}).get("OBSIDIAN_VAULT"),
         },
         "hooks": {
-            "script_exists": HOOK_SCRIPT.exists(),
+            "script_exists": all(s.exists() for s in set(HOOK_SCRIPTS.values())),
             "project_scope": hooks_in(proj_settings),
             "user_scope": hooks_in(user_settings),
+            "missing": sorted(set(HOOK_EVENTS)
+                               - set(hooks_in(proj_settings)) - set(hooks_in(user_settings))),
         },
         "project_rules": {
             "path": str(rules_file),
@@ -520,8 +567,10 @@ def cmd_doctor(args) -> int:
         problems.append(
             f"an mcpServers block sits in {user_settings}, which Claude Code "
             "does not read -- it is inert; re-run: install")
-    if not (report["hooks"]["project_scope"] or report["hooks"]["user_scope"]):
-        problems.append("capture hooks not registered -- run: install")
+    if report["hooks"]["missing"]:
+        problems.append(
+            f"hook event(s) not registered: {', '.join(report['hooks']['missing'])} "
+            "-- run: install")
     if not report["project_rules"]["has_session_start_rule"]:
         problems.append(
             "project rule file missing the context-first rule, so a new "
@@ -533,6 +582,222 @@ def cmd_doctor(args) -> int:
     report["ok"] = not problems
     report["problems"] = problems
     return out(report, not problems)
+
+
+# --------------------------------------------------------- schedule-distill --
+
+# Distillation needs a model's judgment (title/claim/links for each raw
+# capture) -- the server deliberately never summarises, so this can't be a
+# plain cron script. It has to be a real headless agent run, scoped to
+# exactly the tools it needs so nothing else this server exposes gets a free
+# pass. Windows Task Scheduler is the trigger; `claude -p` is the agent.
+DISTILL_TASK_PREFIX = "SecondBrainDistill"
+DISTILL_PROMPT_FILE = "secbrain-distill-prompt.md"
+DISTILL_WRAPPER_FILE = "run-secbrain-distill.ps1"
+DISTILL_LOG_FILE = "secbrain-distill.log"
+DISTILL_BRANCH_PREFIX = "secbrain-distill-"
+DISTILL_ALLOWED_TOOLS = (
+    "mcp__obsidian-secondbrain__vault_info",
+    "mcp__obsidian-secondbrain__distill_queue",
+    "mcp__obsidian-secondbrain__create_concept_note",
+    "mcp__obsidian-secondbrain__mark_distilled",
+    "mcp__obsidian-secondbrain__log_entry",
+    # The prompt below explicitly invites a quick search_notes/find_notes to
+    # link a new note to existing ones -- these have to be in the allow-list
+    # too, or that linking silently no-ops via a denied tool call instead of
+    # failing loudly. Caught by a live-fire test, not by inspection.
+    "mcp__obsidian-secondbrain__search_notes",
+    "mcp__obsidian-secondbrain__find_notes",
+)
+
+DISTILL_PROMPT = """\
+You are running unattended, once a day, with no human present. Do exactly \
+this, then stop -- do not ask questions, there is nobody to answer them.
+
+1. Call vault_info to confirm the vault.
+2. Call distill_queue with limit 15.
+3. For each item returned: read its content, extract the durable ideas, and
+   write each one as a single atomic note via create_concept_note -- title
+   phrased as a claim, linked to existing related notes with [[wikilinks]]
+   where you can find them (a quick search_notes/find_notes is fine, but
+   don't spend more than a couple of calls per item on it). Then call
+   mark_distilled on that item's path, listing the note(s) you produced.
+4. Stop after distilling at most 15 items, even if more remain -- the next
+   run will pick up where this one left off.
+5. Finish with one log_entry summarising the run: how many items were
+   distilled, how many concept notes were created, and how many remain
+   pending.
+
+If distill_queue returns zero pending items, just call log_entry saying so
+and stop. Do not touch anything outside these five calls.
+"""
+
+
+def _validate_time(value: str) -> str:
+    import re as _re
+    if not _re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", value):
+        raise ValueError(f"--time must be HH:MM 24h, got {value!r}")
+    return value
+
+
+def _distill_task_name(project: Path) -> str:
+    # One task per project. A short hash keeps the Task Scheduler name ASCII
+    # and stable regardless of the project path's script (Hebrew, spaces,
+    # length limits), while still being reproducible from the project path
+    # alone so re-running schedule-distill finds and replaces the same task.
+    import hashlib
+    digest = hashlib.sha1(str(project).encode("utf-8")).hexdigest()[:8]
+    return f"{DISTILL_TASK_PREFIX}-{digest}"
+
+
+def cmd_schedule_distill(args) -> int:
+    import platform as _platform
+    if _platform.system() != "Windows":
+        return out({
+            "ok": False,
+            "error": "schedule-distill only supports Windows Task Scheduler today",
+        }, False)
+
+    project = project_dir(args.project)
+    task = _distill_task_name(project)
+
+    if args.remove:
+        proc = subprocess.run(
+            ["schtasks", "/delete", "/tn", task, "/f"],
+            capture_output=True, text=True,
+        )
+        return out({
+            "ok": True,
+            "task_name": task,
+            "removed": proc.returncode == 0,
+            "detail": (proc.stdout or proc.stderr).strip(),
+        })
+
+    vault = vault_dir(project, args.vault)
+    if not vault.is_dir():
+        return out({"ok": False, "error": f"vault does not exist: {vault}. Run init first."}, False)
+
+    try:
+        time_s = _validate_time(args.time)
+    except ValueError as exc:
+        return out({"ok": False, "error": str(exc)}, False)
+
+    claude_exe = shutil.which("claude") or shutil.which("claude.exe")
+    if not claude_exe:
+        return out({"ok": False, "error": "claude executable not found on PATH"}, False)
+
+    claude_dir = project / ".claude"
+    claude_dir.mkdir(parents=True, exist_ok=True)
+
+    # If the project is (or becomes) a git repo, its own bookkeeping -- an
+    # ever-growing log, an absolute machine-specific claude.exe path -- must
+    # never be what a daily backup branch commits. Guarantee the exclusion
+    # here rather than assume a human wrote it, so a run on a fresh git init
+    # can't silently start committing this instead of real project changes.
+    gitignore_path = project / ".gitignore"
+    gitignore_text = gitignore_path.read_text(encoding="utf-8") if gitignore_path.exists() else ""
+    if not any(line.strip() in (".claude/", ".claude") for line in gitignore_text.splitlines()):
+        with gitignore_path.open("a", encoding="utf-8") as fh:
+            if gitignore_text and not gitignore_text.endswith("\n"):
+                fh.write("\n")
+            fh.write("# Added by schedule-distill: machine-specific automation artifacts.\n.claude/\n")
+    prompt_path = claude_dir / DISTILL_PROMPT_FILE
+    prompt_path.write_text(DISTILL_PROMPT, encoding="utf-8")
+
+    log_path = claude_dir / DISTILL_LOG_FILE
+    wrapper_path = claude_dir / DISTILL_WRAPPER_FILE
+    allowed = " ".join(DISTILL_ALLOWED_TOOLS)
+    # --allowedTools scopes exactly these five tools to this one invocation --
+    # nothing is written into the project's shared settings.local.json, so
+    # there's no persistent permission grant to later forget about or drift.
+    #
+    # The git step after it is best-effort and never fails the run: a backup
+    # step that can break the thing it's backing up is worse than no backup.
+    # It only touches the project's own repo (never the vault), commits to a
+    # dated branch, and pushes only once a remote actually exists -- until
+    # then it commits locally and says so.
+    #
+    # It deliberately never does `git checkout main` first. An earlier
+    # version did, to start each day "fresh" -- but any file only ever
+    # committed on a previous day's branch (never merged to main) is, by
+    # definition, untracked on main, and `checkout` syncs the working tree to
+    # match the branch it switches to. That silently DELETED real files
+    # (.gitignore, .mcp.json) from disk the moment a second day's run swapped
+    # back to main. Caught by testing two consecutive runs, not by review.
+    # Instead each day's branch is created from wherever HEAD already is --
+    # a plain `checkout -b` (never `-B`, which resets and would reintroduce
+    # the same data loss), or a plain `checkout` if today's branch already
+    # exists from an earlier run today. Nothing is ever force-reset.
+    wrapper = f"""\
+# Auto-generated by `obsidian_secondbrain.cli schedule-distill`.
+# Safe to regenerate; hand edits are overwritten on the next run of it.
+Set-Location -LiteralPath "{project}"
+$stamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+Add-Content -LiteralPath "{log_path}" -Value "--- run $stamp ---"
+Get-Content -LiteralPath "{prompt_path}" -Raw | & "{claude_exe}" -p `
+    --permission-mode dontAsk `
+    --allowedTools {allowed} `
+    --output-format json *>> "{log_path}"
+
+# --- git backup: dated branch, commit, push if a remote is configured -----
+git -C "{project}" rev-parse --is-inside-work-tree *> $null
+if ($LASTEXITCODE -eq 0) {{
+    $branchDate = Get-Date -Format "yyyy-MM-dd"
+    $branch = "{DISTILL_BRANCH_PREFIX}$branchDate"
+    git -C "{project}" rev-parse --verify --quiet $branch *> $null
+    if ($LASTEXITCODE -eq 0) {{
+        git -C "{project}" checkout $branch *>> "{log_path}"
+    }} else {{
+        git -C "{project}" checkout -b $branch *>> "{log_path}"
+    }}
+    git -C "{project}" add -A *>> "{log_path}"
+    git -C "{project}" diff --cached --quiet
+    if ($LASTEXITCODE -ne 0) {{
+        git -C "{project}" commit -m "Automated distill run $stamp" *>> "{log_path}"
+        $remotes = git -C "{project}" remote
+        if ($remotes) {{
+            git -C "{project}" push -u origin $branch *>> "{log_path}"
+            Add-Content -LiteralPath "{log_path}" -Value "git: pushed $branch to origin"
+        }} else {{
+            Add-Content -LiteralPath "{log_path}" -Value "git: committed to $branch locally (no remote configured yet)"
+        }}
+    }} else {{
+        Add-Content -LiteralPath "{log_path}" -Value "git: nothing to commit"
+    }}
+}} else {{
+    Add-Content -LiteralPath "{log_path}" -Value "git: {project} is not a git repository -- skipped"
+}}
+"""
+    wrapper_path.write_text(wrapper, encoding="utf-8")
+
+    tr = f'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "{wrapper_path}"'
+    proc = subprocess.run(
+        ["schtasks", "/create", "/tn", task, "/tr", tr,
+         "/sc", "daily", "/st", time_s, "/f"],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        return out({"ok": False, "error": (proc.stderr or proc.stdout).strip()}, False)
+
+    return out({
+        "ok": True,
+        "task_name": task,
+        "time": time_s,
+        "project": str(project),
+        "vault": str(vault),
+        "prompt_file": str(prompt_path),
+        "wrapper_script": str(wrapper_path),
+        "log_file": str(log_path),
+        "allowed_tools": list(DISTILL_ALLOWED_TOOLS),
+        "git_backup": {
+            "branch_prefix": DISTILL_BRANCH_PREFIX,
+            "note": "commits the project repo to today's dated branch (created "
+                    "from wherever HEAD already is, never reset) after each "
+                    "run; pushes to origin only once a remote is configured, "
+                    "otherwise commits locally and says so in the log",
+        },
+        "next_step": f'Verify with: schtasks /query /tn "{task}" /v /fo list',
+    })
 
 
 # ------------------------------------------------------------------- main --
@@ -566,10 +831,17 @@ def main(argv: list[str] | None = None) -> int:
     common(sub.add_parser("test-hook", help="fire the capture hook and verify it"))
     common(sub.add_parser("doctor", help="report setup status"))
 
+    p = sub.add_parser("schedule-distill",
+                        help="register/remove a daily headless distillation run (Windows only)")
+    common(p)
+    p.add_argument("--time", default="18:00", help="24h HH:MM local time to run daily (default: 18:00)")
+    p.add_argument("--remove", action="store_true", help="unregister the scheduled task")
+
     args = ap.parse_args(argv)
     return {
         "init": cmd_init, "install": cmd_install, "detect": cmd_detect,
         "test-hook": cmd_test_hook, "doctor": cmd_doctor,
+        "schedule-distill": cmd_schedule_distill,
     }[args.cmd](args)
 
 

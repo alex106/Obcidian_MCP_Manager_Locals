@@ -191,6 +191,10 @@ moves bytes on disk -- it never summarises. The thinking is yours.
   the raw session into the inbox, undistilled. Still call `capture_session`
   with a written summary when a session decided something worth keeping -- a
   hook runs outside the model and cannot summarise.
+- **Inject** happens on its own too: a `SessionStart` hook drops a short vault
+  digest (undistilled backlog count, recent log tail) into context before you
+  see the user's first message. It is a passive index read, not a search --
+  the rule above still applies once you know what the request actually is.
 - **Distil** when asked: `distill_queue` -> `create_concept_note` (one idea per
   note, title phrased as a claim, linked with [[wikilinks]]) -> `mark_distilled`.
 - **Review**: `vault_health`, `related_notes`, `resurface_notes`.

@@ -189,7 +189,7 @@ try:
     check("the stale block's removal is reported to the caller",
           any("ignored mcpServers" in c for c in r.get("caveats", [])), r.get("caveats"))
     check("hooks still go to settings.json",
-          sorted(us.get("hooks", {})) == ["PreCompact", "SessionEnd"],
+          sorted(us.get("hooks", {})) == ["PreCompact", "SessionEnd", "SessionStart"],
           sorted(us.get("hooks", {})))
     check("unrelated settings.json keys preserved", us.get("model") == "Opus")
 
