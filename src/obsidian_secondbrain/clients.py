@@ -105,6 +105,39 @@ def write_codex(path: Path, py: str, vault: str) -> dict:
     return {"files": [str(path), *written], "action": action}
 
 
+def codex_hooks_path(project: Path, scope: str) -> Path:
+    """hooks.json beside the config layer we registered the server in.
+
+    JSON rather than inline [hooks] in config.toml: Codex merges both when a
+    layer has both, and warns, so we own exactly one representation and leave
+    the user's config.toml text alone apart from our server table.
+    """
+    return (project / ".codex" / "hooks.json" if scope == "project"
+            else Path.home() / ".codex" / "hooks.json")
+
+
+def write_codex_hooks(path: Path, entries: dict[str, list[dict]],
+                      owned_scripts: tuple[str, ...]) -> dict:
+    """Merge our hook entries into a Codex hooks.json.
+
+    Any existing matcher group whose JSON mentions one of `owned_scripts` is
+    ours from an earlier install and is replaced; everything else -- other
+    events, other people's hooks, a top-level "description" -- survives.
+    """
+    data = _read_json(path)
+    hooks = data.get("hooks")
+    if not isinstance(hooks, dict):
+        hooks = {}
+    for event, new_groups in entries.items():
+        bucket = hooks.get(event) if isinstance(hooks.get(event), list) else []
+        kept = [g for g in bucket
+                if not any(name in json.dumps(g) for name in owned_scripts)]
+        hooks[event] = kept + new_groups
+    data["hooks"] = hooks
+    return {"files": _write_json(path, data), "action": f"wrote {path.name}",
+            "events": sorted(entries)}
+
+
 # --------------------------------------------------------------- writers ---
 
 def write_claude(project: Path, py: str, vault: str) -> dict:
@@ -205,13 +238,39 @@ the folder taxonomy; it is configurable data, not fixed.
 """
 
 
+CODEX_BODY = """\
+## Second brain (obsidian-secondbrain MCP)
+
+This project has a local Obsidian vault wired up over MCP. The server only
+moves bytes on disk -- it never summarises. The thinking is yours.
+
+- **Capture** as you go: `log_entry` for a fact or half-formed idea.
+- **Compact** happens on its own: `UserPromptSubmit`/`Stop` hooks buffer each
+  turn, and `PreCompact`/`SessionEnd` file that buffer into the inbox,
+  undistilled. Still call `capture_session` with a written summary when a
+  session decided something worth keeping -- a hook runs outside the model and
+  cannot summarise.
+- **Inject** happens on its own too: a `SessionStart` hook adds a short vault
+  digest (undistilled backlog count, recent log tail) as developer context. It
+  is a passive index read, not a search -- the rule above still applies once
+  you know what the request actually is.
+- **Distil** when asked: `distill_queue` -> `create_concept_note` (one idea per
+  note, title phrased as a claim, linked with [[wikilinks]]) -> `mark_distilled`.
+- **Review**: `vault_health`, `related_notes`, `resurface_notes`.
+
+Never edit a raw capture -- distil it instead. Never write an unlinked note:
+`find_notes` or `search_notes` first, then link. Run `vault_info` once to learn
+the folder taxonomy; it is configurable data, not fixed.
+"""
+
+
 def instruction_body(client: str) -> str:
     """The guidance block for `client`, context-first rule on top.
 
     The rule leads because it is the only part that has to fire before the
     agent does anything else; capture and distillation keep until later.
     """
-    body = CLAUDE_BODY if client == "claude" else AGENTS_BODY
+    body = {"claude": CLAUDE_BODY, "codex": CODEX_BODY}.get(client, AGENTS_BODY)
     return SESSION_START_RULE + "\n" + body
 
 

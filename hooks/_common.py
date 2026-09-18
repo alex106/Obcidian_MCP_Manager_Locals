@@ -13,8 +13,21 @@ alone makes a hook a silent no-op in a real session.
 from __future__ import annotations
 
 import os
+import re
 import sys
 from pathlib import Path
+
+_SAFE_ID = re.compile(r"[^A-Za-z0-9_.-]+")
+
+
+def buffer_path(root: Path, session_id: str) -> Path:
+    """Where codex_turn_buffer.py appends a session's turns.
+
+    Lives here because the writer (codex_turn_buffer.py) and the reader
+    (capture_session.py) must agree on it byte for byte.
+    """
+    sid = _SAFE_ID.sub("_", session_id or "unknown")[:120] or "unknown"
+    return root / ".secondbrain" / "buffer" / f"{sid}.jsonl"
 
 
 def looks_like_vault(p: Path) -> bool:
