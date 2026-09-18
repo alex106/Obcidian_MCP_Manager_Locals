@@ -63,39 +63,50 @@ automation around it.
 | 27 MCP tools | yes | yes | yes | yes |
 | `capture_session` (manual compact) | yes | yes | yes | yes |
 | MCP prompts | yes | varies | yes | yes |
-| **Automatic capture hooks** | **yes** | no | no | no |
+| **Automatic capture hooks** | **yes** | **yes** | no | no |
 | `/secbrain-init` skill | yes | no | no | no |
 
-Only *automatic* capture is Claude Code-specific: `PreCompact`/`SessionEnd`
-have no equivalent elsewhere, and the hook parses Claude Code's transcript
-format. Everything else is portable — `capture_session` is an ordinary tool, so
-an agent writing its own summary and filing it works anywhere. `install
---with-instructions` writes `AGENTS.md` / `.github/copilot-instructions.md` /
-`.cursor/rules/secbrain.md` so those agents know to call it.
+Automatic capture now works on both Claude Code and Codex, but not the same
+way. Claude Code's hook parses the `PreCompact`/`SessionEnd` transcript
+directly. Codex documents its rollout transcript format as unstable, so its
+hooks avoid it: `UserPromptSubmit`/`Stop` buffer each turn's stable fields
+(the prompt, the final assistant message) to
+`<vault>/.secondbrain/buffer/<session_id>.jsonl`, and `PreCompact`/`SessionEnd`
+turn that buffer into the same kind of inbox note. Codex also skips every hook
+until it is reviewed and trusted in `/hooks` — `install` and `doctor` both
+say so, and re-trust is needed after any re-install that changes a command.
+Copilot and Cursor have neither event, so capture stays manual there —
+`capture_session` is an ordinary tool, so an agent writing its own summary and
+filing it works anywhere. `install --with-instructions` writes
+`.github/copilot-instructions.md` / `.cursor/rules/secbrain.md` for those two;
+Codex gets `AGENTS.md` by default now, the same way Claude Code gets
+`CLAUDE.md`, no flag needed.
 
 ### Reading the vault at the start of a session
 
 Two mechanisms cover this, and they are deliberately not the same thing.
 
-A `SessionStart` hook (`hooks/session_start.py`, Claude Code only) fires
+A `SessionStart` hook (`hooks/session_start.py`, Claude Code and Codex) fires
 unconditionally on every session start/resume/clear/compact and injects a
 small, passive digest as `additionalContext` — the undistilled backlog count
 and the tail of the most recent log. It never searches anything; it can't,
 because the user's actual request doesn't exist yet at that point.
 
 `install` also writes a marked block into the project's rule file — `CLAUDE.md`
-for Claude Code, with no flag needed — whose first instruction is: **before
-acting on the first request of a session, search the vault**. This is the
-*active* half: a targeted `search_notes`/`find_notes` once the request is
-known, which a hook firing before any user text exists structurally cannot do.
+for Claude Code, `AGENTS.md` for Codex, with no flag needed for either — whose
+first instruction is: **before acting on the first request of a session,
+search the vault**. This is the *active* half: a targeted
+`search_notes`/`find_notes` once the request is known, which a hook firing
+before any user text exists structurally cannot do.
 
-Every client gets the rule, Claude Code included, because a capture hook only
-*writes* the vault when a session **ends** — without the rule (or, for Claude
-Code, on top of the hook's passive digest), the vault only ever fills up, and
-a session starts by re-deriving what is already written down. `doctor` reports
+Every client gets the rule, Claude Code and Codex included, because a capture
+hook only *writes* the vault when a session **ends** — without the rule (or,
+on top of the hook's passive digest), the vault only ever fills up, and a
+session starts by re-deriving what is already written down. `doctor` reports
 `project_rules.has_session_start_rule` and `hooks.missing` (which lists any of
-`PreCompact`/`SessionEnd`/`SessionStart` not yet registered), and
-`--no-instructions` opts out of the rule file specifically.
+`PreCompact`/`SessionEnd`/`SessionStart` not yet registered, plus
+`UserPromptSubmit`/`Stop` on the Codex path), and `--no-instructions` opts out
+of the rule file specifically.
 
 `detect` identifies the client from evidence and distinguishes an `agent`
 signal (we are running as it) from a `host` signal (it is merely the editor
@@ -103,10 +114,19 @@ hosting the terminal) — Claude Code inside a VS Code terminal makes both look
 active.
 
 ```bash
-$PY -m obsidian_secondbrain.cli install --project . --client codex  --scope user --with-instructions
-$PY -m obsidian_secondbrain.cli install --project . --client vscode --with-instructions
-$PY -m obsidian_secondbrain.cli install --project . --client all
+$PY -m obsidian_secondbrain.cli install   --project . --client codex  --scope user
+$PY -m obsidian_secondbrain.cli install   --project . --client vscode --with-instructions
+$PY -m obsidian_secondbrain.cli install   --project . --client all
+$PY -m obsidian_secondbrain.cli test-hook --project . --client codex
+$PY -m obsidian_secondbrain.cli doctor    --project . --client codex
 ```
+
+`test-hook` and `doctor` default to `--client claude`; pass `--client codex`
+to check the Codex-side wiring (hooks.json, the turn buffer, AGENTS.md)
+instead. Neither command can see whether Codex has actually **trusted** the
+hooks in `/hooks` — that state lives only in Codex, keyed by each hook's
+hash — so both report the caveat explicitly rather than implying a passing
+check means capture is live.
 
 Config shapes are not interchangeable, and a wrong shape is silently ignored
 with no error: VS Code uses root key `servers` and requires `"type": "stdio"`;
@@ -157,7 +177,7 @@ titled as a claim, linked into the existing graph. Review fights the
 write-only vault.
 
 ```
-INJECT   →  the SessionStart hook (Claude Code) + the context-first rule
+INJECT   →  the SessionStart hook (Claude Code, Codex) + the context-first rule
 CAPTURE  →  log_entry, append_to_note, the PreCompact/SessionEnd hooks
 COMPACT  →  capture_session   (agent writes the summary, server files it)
 DISTILL  →  distill_queue → create_concept_note → mark_distilled
@@ -193,18 +213,29 @@ summary (what, why, decisions, open questions, artifacts) and the server files
 it as a session note marked undistilled, plus a pointer in the day's log.
 
 The `PreCompact`/`SessionEnd` hook runs *outside* the model, so it cannot
-summarise anything. It files the raw transcript — user prompts and assistant
-text only, no tool spam, most recent ~20k chars — into the inbox as an
-undistilled note. The next `distill_queue` call hands that to the agent, which
-does the thinking. Automatic capture without ever needing a model behind the
-server's back.
+summarise anything. It files raw material — user prompts and assistant text
+only, no tool spam, most recent ~20k chars — into the inbox as an undistilled
+note. On Claude Code that material is the transcript at `transcript_path`. On
+Codex, whose transcript format is documented as unstable, it is instead
+whatever `hooks/codex_turn_buffer.py` already appended from
+`UserPromptSubmit.prompt` and `Stop.last_assistant_message` — two fields Codex
+does treat as stable — to `<vault>/.secondbrain/buffer/<session_id>.jsonl`;
+the buffer is consumed (deleted) once its note is written, so a `PreCompact`
+capture followed by a `SessionEnd` capture never files the same turns twice.
+The next `distill_queue` call hands the note to the agent, which does the
+thinking. Automatic capture without ever needing a model behind the server's
+back.
 
 The `SessionStart` hook (`hooks/session_start.py`) is the same idea run in
 reverse: it can't summarise either, so it just counts and quotes — the
 undistilled backlog size and the tail of the latest log — and hands that back
 as `additionalContext`. Injection without a model in the hook, same as capture.
 
-The hook always exits 0. A failed capture never blocks your session.
+Every hook always exits 0. A failed capture never blocks your session. On
+Codex this matters doubly: `SessionEnd` gets 1 s by default and 3 s at the
+hard ceiling, so its capture only ever has to rename a buffer file into a
+note — the actual buffering already happened earlier, in `UserPromptSubmit`
+and `Stop`, where there's no shared time budget to blow.
 
 ## Safety
 
@@ -227,12 +258,14 @@ src/obsidian_secondbrain/
   cli.py       detect / doctor / init / install / test-hook bootstrap
   environment.py  evidence-based OS + client detection
   clients.py      per-client config writers (json / toml shapes)
-hooks/capture_session.py    PreCompact / SessionEnd raw capture
-hooks/session_start.py      SessionStart digest injection
-hooks/_common.py            shared vault resolution for both hook scripts
+hooks/capture_session.py    PreCompact / SessionEnd raw capture (Claude Code + Codex)
+hooks/session_start.py      SessionStart digest injection (Claude Code + Codex)
+hooks/codex_turn_buffer.py  Codex UserPromptSubmit / Stop: buffers each turn's stable fields
+hooks/_common.py            shared vault resolution + the Codex buffer path, for all hook scripts
 scripts/install.py          user-scope registration (~/.claude.json + settings.json)
 skills/secbrain-init/       Claude Code skill: /secbrain-init
 tests/test_lifecycle.py     34 assertions over a real stdio MCP client
 tests/test_hook_wiring.py   proves test-hook rejects an env-only hook
 tests/test_clients.py       pins each client's config shape
+tests/test_codex_hooks.py   install/test-hook/doctor --client codex, end to end
 ```
