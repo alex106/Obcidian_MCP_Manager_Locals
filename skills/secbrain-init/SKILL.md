@@ -106,13 +106,19 @@ something to write by hand:
 |---|---|---|
 | `claude` (`--scope project`) | `.mcp.json` + `.claude/settings.local.json` | `mcpServers`, plus hooks |
 | `claude` (`--scope user`) | `~/.claude.json` + `~/.claude/settings.json` | `mcpServers` in the **first** file, hooks in the second |
-| `codex` | `~/.codex/config.toml` (`--scope project` → `.codex/config.toml`) | TOML `[mcp_servers.NAME]` |
+| `codex` | `~/.codex/config.toml` + `~/.codex/hooks.json` (`--scope project` → `.codex/…`) | TOML `[mcp_servers.NAME]`, plus hooks in `hooks.json` |
 | `vscode` | `.vscode/mcp.json` | `servers` (**not** `mcpServers`), needs `"type": "stdio"` |
 | `copilot` | workspace `.mcp.json` | `mcpServers` — the Agent Host does not read `.vscode/mcp.json` |
 | `cursor` | `.cursor/mcp.json` | `mcpServers` |
 
+Codex gets five hooks — `SessionStart` (digest), `UserPromptSubmit` and `Stop`
+(buffer each turn from the event payload), `PreCompact` and `SessionEnd` (file
+the buffer into the inbox) — and `AGENTS.md` by default, the way Claude Code
+gets `CLAUDE.md`. Capture deliberately does **not** parse the Codex transcript:
+Codex documents that format as unstable.
+
 For any client in `manual_capture_only`, add `--with-instructions`. That writes
-`AGENTS.md` (Codex), `.github/copilot-instructions.md` (Copilot/VS Code) or
+`.github/copilot-instructions.md` (Copilot/VS Code) or
 `.cursor/rules/secbrain.md` — telling that agent to call `capture_session`
 itself, since nothing will do it automatically. The block is marked and
 replaced on re-run, so it never stacks.
@@ -215,8 +221,25 @@ will happily pass a hook that does nothing in practice.
 | daily log got a pointer | log folder renamed in `config.json` |
 | SessionStart hook emits additionalContext | registered command missing `--vault`, or `obsidian_secondbrain` not importable from that interpreter |
 
-**If the client does not support hooks** (`codex`, `vscode`, `copilot`,
-`cursor`): do **not** run `test-hook` — there is nothing to test, and saying
+**If the client is `codex`:**
+
+```
+"$PY" -m obsidian_secondbrain.cli test-hook --client codex --project "<root>"
+"$PY" -m obsidian_secondbrain.cli doctor    --client codex --project "<root>"
+```
+
+Same principle — the registered commands, `OBSIDIAN_VAULT` stripped — driven
+by Codex's events: `UserPromptSubmit` + `Stop` must fill the turn buffer, and
+`SessionEnd` with no transcript must turn it into one inbox note **inside 3
+seconds** (Codex's hard ceiling for that event). Then the digest checks.
+
+What neither command can see: **whether Codex trusts the hooks.** Codex skips
+every non-managed hook until it is reviewed and trusted in `/hooks`, and the
+trust is pinned to the hook's hash — so a re-install that changes a command
+needs re-trusting. Never report Codex capture as working without telling the
+user to open `/hooks` and trust the five `obsidian-secondbrain` entries.
+
+**If the client does not support hooks** (`vscode`, `copilot`, `cursor`): do **not** run `test-hook` — there is nothing to test, and saying
 "capture is working" would be false. Instead state plainly that automatic
 capture is unavailable on that client, confirm `--with-instructions` wrote the
 guidance file, and tell the user that sessions are recorded only when the agent

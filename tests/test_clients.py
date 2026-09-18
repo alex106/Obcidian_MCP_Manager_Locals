@@ -102,7 +102,11 @@ try:
     check("capture_session instruction added", "capture_session" in a)
     # Normalise: the source wraps this sentence across lines.
     flat = " ".join(a.split())
-    check("says automatic capture is unavailable", "no automatic session hook" in flat)
+    # Codex has lifecycle hooks now; the old "capture is manual" text would be
+    # wrong -- AGENTS.md must describe the buffer + SessionEnd capture instead.
+    check("no longer says automatic capture is unavailable",
+          "no automatic session hook" not in flat)
+    check("describes the hook-driven capture", "SessionEnd" in flat and "Stop" in flat)
 
     cli("install", "--project", str(proj), "--client", "codex",
         "--scope", "project", "--with-instructions")

@@ -44,6 +44,25 @@ HOOK_SCRIPTS: dict[str, Path] = {
 }
 HOOK_EVENTS = tuple(HOOK_SCRIPTS)
 
+# Codex has the same lifecycle events plus the two turn events the buffer
+# needs. Capture reads the buffer (stable hook fields), not the transcript,
+# which Codex documents as an unstable format.
+CODEX_BUFFER_SCRIPT = PROJECT_ROOT / "hooks" / "codex_turn_buffer.py"
+CODEX_HOOK_SCRIPTS: dict[str, Path] = {
+    "SessionStart": SESSION_START_SCRIPT,
+    "UserPromptSubmit": CODEX_BUFFER_SCRIPT,
+    "Stop": CODEX_BUFFER_SCRIPT,
+    "PreCompact": HOOK_SCRIPT,
+    "SessionEnd": HOOK_SCRIPT,
+}
+CODEX_HOOK_EVENTS = tuple(CODEX_HOOK_SCRIPTS)
+# SessionEnd: Codex default is 1 s, hard maximum 3 s. Anything larger is
+# clamped or rejected, so ask for exactly the ceiling.
+CODEX_HOOK_TIMEOUTS = {"SessionEnd": 3}
+CODEX_DEFAULT_TIMEOUT = 10
+CODEX_SESSION_END_BUDGET_S = 3.0
+ALL_HOOK_SCRIPTS = set(HOOK_SCRIPTS.values()) | set(CODEX_HOOK_SCRIPTS.values())
+
 # Claude Code reads user-scoped MCP servers from ~/.claude.json, and hooks from
 # ~/.claude/settings.json. They are different files with different schemas:
 # `settings.json` has no `mcpServers` key, so a server written there is dropped
@@ -221,7 +240,7 @@ def cmd_install(args) -> int:
     vault = vault_dir(project, args.vault)
     if not vault.is_dir():
         return out({"ok": False, "error": f"vault does not exist: {vault}. Run init first."}, False)
-    missing_scripts = [str(s) for s in set(HOOK_SCRIPTS.values()) if not s.exists()]
+    missing_scripts = [str(s) for s in ALL_HOOK_SCRIPTS if not s.exists()]
     if missing_scripts:
         return out({"ok": False, "error": f"hook script(s) missing: {missing_scripts}"}, False)
 
@@ -239,6 +258,37 @@ def cmd_install(args) -> int:
             path = (project / ".codex" / "config.toml" if args.scope == "project"
                     else Path.home() / ".codex" / "config.toml")
             results[key] = _clients.write_codex(path, py, vault_s)
+            if not args.no_hooks:
+                hooks_path = _clients.codex_hooks_path(project, args.scope)
+                entries = {
+                    event: [{"hooks": [{
+                        "type": "command",
+                        # --vault on the command line, same reason as Claude:
+                        # a hook does not inherit the server's env block.
+                        "command": f'"{py}" "{script}" --vault "{vault_s}"',
+                        "timeout": CODEX_HOOK_TIMEOUTS.get(event, CODEX_DEFAULT_TIMEOUT),
+                    }]}]
+                    for event, script in CODEX_HOOK_SCRIPTS.items()
+                }
+                hr = _clients.write_codex_hooks(
+                    hooks_path, entries,
+                    tuple({s.name for s in CODEX_HOOK_SCRIPTS.values()}))
+                results[key]["files"].extend(hr["files"])
+                results[key]["hooks"] = hr["events"]
+                notes.append(
+                    f"codex: hooks written to {hooks_path}, but Codex skips them "
+                    "until you review and trust them in /hooks -- and again "
+                    "after any re-install that changes a command")
+            else:
+                notes.append("codex: --no-hooks -- capture must be called by the agent")
+            # Codex now has hooks, so -- like CLAUDE.md for Claude -- the
+            # context-first rule is written by default, not only on request.
+            if not args.no_instructions:
+                target = _clients.INSTRUCTION_FILE["codex"](project)
+                results[key]["files"].extend(
+                    _clients.write_instructions(target, "codex")["files"])
+                results[key]["project_rules"] = str(target)
+            continue
         else:
             writer = _clients.WRITERS.get(key)
             if writer is None:
@@ -351,14 +401,24 @@ SYNTH_TRANSCRIPT = [
 ]
 
 
-def registered_hook_command(project: Path, event: str) -> str | None:
+def registered_hook_command(project: Path, event: str,
+                            client: str = "claude") -> str | None:
     """The command actually registered for one hook event, project scope first."""
-    script_name = HOOK_SCRIPTS[event].name
-    for path in (project / ".claude" / "settings.local.json",
+    if client == "codex":
+        script_name = CODEX_HOOK_SCRIPTS[event].name
+        paths = (project / ".codex" / "hooks.json",
+                 Path.home() / ".codex" / "hooks.json")
+    else:
+        script_name = HOOK_SCRIPTS[event].name
+        paths = (project / ".claude" / "settings.local.json",
                  project / ".claude" / "settings.json",
-                 Path.home() / ".claude" / "settings.json"):
+                 Path.home() / ".claude" / "settings.json")
+    for path in paths:
         settings = read_json(path)
-        for entry in settings.get("hooks", {}).get(event, []):
+        hooks = settings.get("hooks")
+        if not isinstance(hooks, dict):
+            continue
+        for entry in hooks.get(event, []) or []:
             for h in entry.get("hooks", []):
                 if script_name in h.get("command", ""):
                     return h["command"]
@@ -367,6 +427,8 @@ def registered_hook_command(project: Path, event: str) -> str | None:
 
 def cmd_test_hook(args) -> int:
     """Actually fire the hook and verify it wrote a note, then clean up."""
+    if getattr(args, "client", "claude") == "codex":
+        return cmd_test_hook_codex(args)
     project = project_dir(args.project)
     vault = vault_dir(project, args.vault)
     if not vault.is_dir():
@@ -496,9 +558,166 @@ def cmd_test_hook(args) -> int:
     }, ok)
 
 
+def _vault_folders(vault: Path) -> dict:
+    cfg_file = vault / ".secondbrain" / "config.json"
+    folders = dict(DEFAULT_CONFIG["folders"])
+    if cfg_file.exists():
+        folders.update(read_json(cfg_file).get("folders", {}))
+    folders.setdefault("log", "10-Log")
+    return folders
+
+
+def cmd_test_hook_codex(args) -> int:
+    """Codex: fire the registered buffer + capture + digest hooks, then clean up.
+
+    Same contract as the Claude test -- run the commands exactly as REGISTERED,
+    with OBSIDIAN_VAULT stripped -- but driven by the events Codex actually
+    sends: UserPromptSubmit and Stop fill the turn buffer, SessionEnd (with no
+    transcript at all) must turn that buffer into one inbox note inside the
+    3-second SessionEnd ceiling.
+
+    What it cannot check: whether Codex has TRUSTED these hooks. That lives in
+    Codex's own state, keyed by each hook's hash; an untrusted hook is simply
+    skipped. The result says so rather than implying 'passed' means 'running'.
+    """
+    import time as _time
+
+    project = project_dir(args.project)
+    vault = vault_dir(project, args.vault)
+    if not vault.is_dir():
+        return out({"ok": False, "error": f"vault does not exist: {vault}. Run init first."}, False)
+    missing_scripts = [str(s) for s in set(CODEX_HOOK_SCRIPTS.values()) if not s.exists()]
+    if missing_scripts:
+        return out({"ok": False, "error": f"hook script(s) missing: {missing_scripts}"}, False)
+
+    folders = _vault_folders(vault)
+    inbox = vault / folders["inbox"]
+    today_log = vault / folders["log"] / f"{_dt.date.today():%Y-%m-%d}.md"
+    before = set(inbox.glob("*.md")) if inbox.exists() else set()
+    log_before = today_log.read_bytes() if today_log.exists() else None
+
+    sid = "secbrain-selftest-codex"
+    sys.path.insert(0, str(PROJECT_ROOT / "hooks"))
+    from _common import buffer_path  # the hooks' own definition, not a copy
+    buf = buffer_path(vault, sid)
+    buf_dir_existed = buf.parent.exists()
+
+    checks: list[dict] = []
+
+    def record(name, ok, detail=""):
+        checks.append({"check": name, "ok": bool(ok), "detail": detail})
+
+    # No CLAUDE_PROJECT_DIR: Codex does not set it. The payload cwd is all a
+    # real Codex hook gets, so that is all this one gets.
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("OBSIDIAN_VAULT", "CLAUDE_PROJECT_DIR")}
+
+    def fire(event: str, extra: dict):
+        cmd = registered_hook_command(project, event, "codex")
+        payload = {"session_id": sid, "cwd": str(project), "hook_event_name": event,
+                   "transcript_path": None, "model": "selftest", **extra}
+        t0 = _time.monotonic()
+        proc = subprocess.run(cmd or "exit 97", shell=True, input=json.dumps(payload),
+                              text=True, encoding="utf-8", capture_output=True,
+                              timeout=30, env=env)
+        return cmd, proc, _time.monotonic() - t0
+
+    missing = [e for e in CODEX_HOOK_EVENTS if registered_hook_command(project, e, "codex") is None]
+    record("all Codex hook events registered in hooks.json", not missing,
+           f"missing: {missing} (looked in {project / '.codex' / 'hooks.json'} "
+           f"and {Path.home() / '.codex' / 'hooks.json'})")
+
+    try:
+        _, p1, _ = fire("UserPromptSubmit", {"turn_id": "t1", "prompt":
+                                             "secbrain codex self-test SECBRAIN_PROMPT_OK",
+                                             "permission_mode": "default"})
+        record("UserPromptSubmit hook exits 0 and prints nothing",
+               p1.returncode == 0 and not p1.stdout.strip(),
+               f"rc={p1.returncode} stdout={p1.stdout.strip()[:120]!r} "
+               f"stderr={p1.stderr.strip()[:200]}")
+
+        _, p2, _ = fire("Stop", {"turn_id": "t1", "stop_hook_active": False,
+                                 "last_assistant_message": "Marker: SECBRAIN_HOOK_SELFTEST_OK",
+                                 "permission_mode": "default"})
+        stop_json_ok = False
+        try:
+            stop_json_ok = isinstance(json.loads(p2.stdout.strip() or "x"), dict)
+        except json.JSONDecodeError:
+            pass
+        record("Stop hook exits 0 with JSON on stdout (Codex requires it)",
+               p2.returncode == 0 and stop_json_ok,
+               f"rc={p2.returncode} stdout={p2.stdout.strip()[:120]!r}")
+
+        lines = buf.read_text(encoding="utf-8").splitlines() if buf.exists() else []
+        record("turn buffer holds the prompt and the reply", len(lines) == 2,
+               f"{buf}: {len(lines)} line(s)")
+
+        _, p3, elapsed = fire("SessionEnd", {"reason": "other"})
+        record("SessionEnd hook exits 0", p3.returncode == 0,
+               f"rc={p3.returncode} stderr={p3.stderr.strip()[:300]}")
+        record(f"SessionEnd finishes inside Codex's {CODEX_SESSION_END_BUDGET_S:.0f} s ceiling",
+               elapsed < CODEX_SESSION_END_BUDGET_S, f"took {elapsed:.2f} s")
+
+        after = set(inbox.glob("*.md")) if inbox.exists() else set()
+        new = sorted(after - before)
+        record("SessionEnd wrote exactly one inbox note", len(new) == 1,
+               f"new={[p.name for p in new]}")
+        body = new[0].read_text(encoding="utf-8") if new else ""
+        record("note carries both the prompt and the reply",
+               "SECBRAIN_PROMPT_OK" in body and "SECBRAIN_HOOK_SELFTEST_OK" in body)
+        record("note marked undistilled, sourced from the buffer",
+               "distilled: false" in body and "source: codex-buffer" in body)
+        record("turn buffer consumed", not buf.exists(), str(buf))
+        record("daily log got a pointer",
+               today_log.exists() and "Raw capture" in today_log.read_text(encoding="utf-8"))
+
+        _, p4, _ = fire("SessionStart", {"source": "startup", "permission_mode": "default"})
+        digest = ""
+        try:
+            digest = json.loads(p4.stdout.strip() or "{}").get(
+                "hookSpecificOutput", {}).get("additionalContext", "")
+        except json.JSONDecodeError:
+            pass
+        record("SessionStart hook exits 0 and emits additionalContext",
+               p4.returncode == 0 and bool(digest),
+               f"rc={p4.returncode} stdout={p4.stdout.strip()[:200]!r}")
+        record("SessionStart digest mentions the vault's undistilled count",
+               "undistilled" in digest.lower())
+    finally:
+        after = set(inbox.glob("*.md")) if inbox.exists() else set()
+        for p in after - before:
+            p.unlink(missing_ok=True)
+        if log_before is None:
+            today_log.unlink(missing_ok=True)
+        else:
+            today_log.write_bytes(log_before)
+        buf.unlink(missing_ok=True)
+        if not buf_dir_existed:
+            shutil.rmtree(buf.parent, ignore_errors=True)
+
+    passed = [c for c in checks if c["ok"]]
+    ok = len(passed) == len(checks)
+    return out({
+        "ok": ok,
+        "client": "codex",
+        "passed": len(passed),
+        "total": len(checks),
+        "checks": checks,
+        "cleaned_up": True,
+        "not_verifiable_here": (
+            "whether Codex has trusted these hooks. Open /hooks in Codex and "
+            "trust them; until then Codex skips them and nothing is captured, "
+            "however many checks passed here."),
+        "summary": ("hooks are wired and the scripts work -- trust them in /hooks"
+                    if ok else "hooks are NOT working correctly"),
+    }, ok)
+
+
 # ----------------------------------------------------------------- doctor --
 
 def cmd_doctor(args) -> int:
+    if getattr(args, "client", "claude") == "codex":
+        return cmd_doctor_codex(args)
     project = project_dir(args.project)
     vault = vault_dir(project, args.vault)
 
@@ -581,6 +800,95 @@ def cmd_doctor(args) -> int:
 
     report["ok"] = not problems
     report["problems"] = problems
+    return out(report, not problems)
+
+
+def cmd_doctor_codex(args) -> int:
+    """Codex-side status: server table, hooks.json, AGENTS.md rule."""
+    import tomllib
+
+    project = project_dir(args.project)
+    vault = vault_dir(project, args.vault)
+
+    def server_in(path: Path) -> dict | None:
+        if not path.exists():
+            return None
+        try:
+            data = tomllib.loads(path.read_text(encoding="utf-8"))
+        except (tomllib.TOMLDecodeError, UnicodeDecodeError):
+            return None
+        srv = data.get("mcp_servers", {}).get(SERVER_KEY)
+        return srv if isinstance(srv, dict) else None
+
+    proj_cfg = project / ".codex" / "config.toml"
+    user_cfg = Path.home() / ".codex" / "config.toml"
+    registered = server_in(proj_cfg) or server_in(user_cfg)
+
+    def hooks_in(path: Path) -> list[str]:
+        h = read_json(path).get("hooks")
+        if not isinstance(h, dict):
+            return []
+        return [e for e, script in CODEX_HOOK_SCRIPTS.items()
+                if script.name in json.dumps(h.get(e, []))]
+
+    proj_hooks = project / ".codex" / "hooks.json"
+    user_hooks = Path.home() / ".codex" / "hooks.json"
+    found = set(hooks_in(proj_hooks)) | set(hooks_in(user_hooks))
+
+    rules_file = _clients.INSTRUCTION_FILE["codex"](project)
+    rules_text = (rules_file.read_text(encoding="utf-8", errors="replace")
+                  if rules_file.exists() else "")
+    has_rules = _clients.AGENTS_SECTION_START in rules_text
+
+    report = {
+        "client": "codex",
+        "project": str(project),
+        "vault": {"path": str(vault), "exists": vault.is_dir(),
+                  "recognised_as_vault": is_vault(vault)},
+        "mcp_server": {
+            "registered_project": bool(server_in(proj_cfg)),
+            "registered_user": bool(server_in(user_cfg)),
+            "vault_it_points_at": (registered or {}).get("env", {}).get("OBSIDIAN_VAULT"),
+        },
+        "hooks": {
+            "project_scope": hooks_in(proj_hooks),
+            "user_scope": hooks_in(user_hooks),
+            "missing": sorted(set(CODEX_HOOK_EVENTS) - found),
+            "trusted": "unknown -- check /hooks in Codex",
+        },
+        "project_rules": {
+            "path": str(rules_file),
+            "has_session_start_rule": has_rules and (
+                "Start every session by reading the vault" in rules_text),
+            # An AGENTS.md from before hooks existed tells the agent capture
+            # is manual. Harmless, but wrong -- and worth a re-install.
+            "stale_manual_capture_text": "no automatic session hook" in rules_text,
+        },
+    }
+
+    problems = []
+    if not vault.is_dir():
+        problems.append("vault missing -- run: init")
+    if not registered:
+        problems.append("MCP server not registered in .codex/config.toml or "
+                        "~/.codex/config.toml -- run: install --client codex")
+    if report["hooks"]["missing"]:
+        problems.append(f"Codex hook event(s) not registered: "
+                        f"{', '.join(report['hooks']['missing'])} -- run: install --client codex")
+    if not report["project_rules"]["has_session_start_rule"]:
+        problems.append(f"AGENTS.md missing the context-first rule -- run: "
+                        f"install --client codex ({rules_file})")
+    if report["project_rules"]["stale_manual_capture_text"]:
+        problems.append("AGENTS.md still says Codex has no session hooks -- "
+                        "re-run: install --client codex")
+    pointed = report["mcp_server"]["vault_it_points_at"]
+    if pointed and Path(pointed).resolve() != vault:
+        problems.append(f"registered server points at a different vault: {pointed}")
+
+    report["ok"] = not problems
+    report["problems"] = problems
+    report["reminder"] = ("Even with ok: true, Codex runs these hooks only once "
+                          "they are trusted in /hooks.")
     return out(report, not problems)
 
 
@@ -826,10 +1134,15 @@ def main(argv: list[str] | None = None) -> int:
                         "tells the agent to search the vault before acting on "
                         "the first request of a session")
     p.add_argument("--with-instructions", action="store_true",
-                   help="also write AGENTS.md / copilot-instructions.md for "
-                        "clients that have no session hooks")
-    common(sub.add_parser("test-hook", help="fire the capture hook and verify it"))
-    common(sub.add_parser("doctor", help="report setup status"))
+                   help="also write copilot-instructions.md / cursor rules "
+                        "for clients that have no session hooks (Codex gets "
+                        "AGENTS.md by default now, like Claude gets CLAUDE.md)")
+    for name, help_ in (("test-hook", "fire the capture hook and verify it"),
+                        ("doctor", "report setup status")):
+        p = sub.add_parser(name, help=help_)
+        common(p)
+        p.add_argument("--client", default="claude", choices=["claude", "codex"],
+                       help="which client's hook wiring to check (default: claude)")
 
     p = sub.add_parser("schedule-distill",
                         help="register/remove a daily headless distillation run (Windows only)")

@@ -119,7 +119,7 @@ def detect_claude_code(project: Path) -> Client:
 
 def detect_codex(project: Path) -> Client:
     c = Client("codex", "OpenAI Codex CLI",
-               capabilities=Capabilities(mcp_prompts=False))
+               capabilities=Capabilities(mcp_prompts=False, session_hooks=True))
     binary = _which("codex")
     if binary:
         c.installed = True
@@ -139,8 +139,15 @@ def detect_codex(project: Path) -> Client:
         c.evidence.append("running inside a Codex session")
     c.config_target = str(user_cfg)
     c.caveats = [
-        "No session hooks: Codex has no PreCompact/SessionEnd equivalent, so "
-        "automatic capture is unavailable. Call capture_session explicitly.",
+        "Hooks are on by default (SessionStart, UserPromptSubmit, Stop, "
+        "PreCompact, SessionEnd), but a non-managed hook is skipped until it "
+        "is reviewed and trusted in /hooks -- and trust is pinned to the hook's "
+        "hash, so every install that changes a command needs re-trusting. "
+        "Nothing on disk shows that state; test-hook cannot see it either.",
+        "Capture reads UserPromptSubmit.prompt and Stop.last_assistant_message, "
+        "not the transcript: Codex documents its transcript format as unstable.",
+        "SessionEnd gets 1 s by default and 3 s at most, so it only renames the "
+        "turn buffer into an inbox note.",
         "MCP prompt support varies by version; drive the workflow from AGENTS.md "
         "instead of relying on /distill.",
     ]
